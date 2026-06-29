@@ -1,28 +1,33 @@
 {
-	"name": "@psmfd/pi-auto-router",
-	"version": "0.1.0",
-	"description": "Pi extension: per-prompt model selection via a cheap classifier (before_agent_start -> pi.setModel)",
-	"type": "module",
-	"license": "MIT",
-	"repository": "github:psmfd/pi-auto-router",
-	"keywords": ["pi", "pi-extension"],
-	"pi": {
-		"extensions": ["./index.ts"]
-	},
-	"scripts": {
-		"typecheck": "tsc --noEmit",
-		"test": "tsx --test test/*.test.ts"
-	},
-	"dependencies": {
-		"@earendil-works/pi-ai": "0.79.3"
-	},
-	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": ">=0.75"
-	},
-	"devDependencies": {
-		"@earendil-works/pi-coding-agent": "0.79.3",
-		"@types/node": "^25.9.3",
-		"tsx": "^4.19.2",
-		"typescript": "^6.0.3"
-	}
+  "name": "@psmfd/pi-auto-router",
+  "version": "0.1.1",
+  "description": "Pi extension: per-prompt model selection via a cheap classifier (before_agent_start -> pi.setModel)",
+  "type": "module",
+  "license": "MIT",
+  "repository": "github:psmfd/pi-auto-router",
+  "keywords": [
+    "pi",
+    "pi-extension"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.79.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.75"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.79.3",
+    "@types/node": "^25.9.3",
+    "tsx": "^4.19.2",
+    "typescript": "^6.0.3"
+  }
 }

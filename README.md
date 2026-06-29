@@ -6,6 +6,14 @@ picks the best credentialed model for each user prompt and applies it with
 Suite (#327); consumes the [`shared/`](https://github.com/psmfd/pi-config/blob/main/agent/extensions/shared/README.md) foundation. See
 [ADR-0031](https://github.com/psmfd/pi-config/blob/main/adrs/0031-auto-router.md).
 
+## Install
+
+```sh
+pi install git:github.com/psmfd/pi-auto-router
+```
+
+Try it first without installing: `pi -e git:github.com/psmfd/pi-auto-router`.
+
 ## Flow
 
 1. `before_agent_start` fires once per prompt. If routing is off, no-op (manual `/model` is untouched).
