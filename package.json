@@ -1,6 +1,6 @@
 {
   "name": "@psmfd/pi-auto-router",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Pi extension: per-prompt model selection via a cheap classifier (before_agent_start -> pi.setModel)",
   "type": "module",
   "license": "MIT",
@@ -25,7 +25,7 @@
     "@earendil-works/pi-coding-agent": ">=0.75"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.79.3",
+    "@earendil-works/pi-coding-agent": "0.80.3",
     "@types/node": "^25.9.3",
     "tsx": "^4.19.2",
     "typescript": "^6.0.3"
