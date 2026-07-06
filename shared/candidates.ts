@@ -45,6 +45,25 @@ export interface CandidateOptions {
    * `allowlist` as AND — a candidate must pass both.
    */
   readonly copilotFilter?: ReadonlySet<string> | null | undefined;
+  /**
+   * Live availability filter for `anthropic` models (#538): the set of model
+   * ids the API can actually serve (`GET /v1/models`), dropping retired ids
+   * the static registry still lists. Same semantics as `copilotFilter`:
+   * `null`/`undefined`/empty disables the filter (fail open), so a failed
+   * discovery never empties the menu. Non-anthropic candidates are never
+   * affected. Composes with the other filters as AND.
+   */
+  readonly anthropicFilter?: ReadonlySet<string> | null | undefined;
+  /**
+   * Live availability filter for `omlx` models (#364): the set of model ids
+   * the local server actually serves. Unlike `copilotFilter`, an EMPTY set is
+   * authoritative (server confirmed down → every omlx candidate is dropped);
+   * only `null`/`undefined` disables the filter (probe inconclusive → fail
+   * open). Non-omlx candidates are never affected, so even an empty set can
+   * only remove local candidates, not frontier ones. Composes with the other
+   * filters as AND.
+   */
+  readonly omlxFilter?: ReadonlySet<string> | null | undefined;
 }
 
 const DEFAULT_CONTEXT_WINDOW = 128_000;
@@ -64,13 +83,22 @@ export async function getCandidates(
   // no-op, so a failed or zero-result discovery never empties the menu (#343).
   const copilotFilter =
     options.copilotFilter && options.copilotFilter.size > 0 ? options.copilotFilter : null;
+  // Same fail-open contract for the anthropic filter (#538): only a non-empty
+  // set narrows the menu; a failed discovery leaves the static menu unchanged.
+  const anthropicFilter =
+    options.anthropicFilter && options.anthropicFilter.size > 0 ? options.anthropicFilter : null;
+  // The omlx filter is authoritative even when empty (#364) — only null/undefined
+  // disables it. It touches omlx-provider models exclusively.
+  const omlxFilter = options.omlxFilter ?? null;
   const fallbackWindow = options.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW;
 
   const out: Candidate[] = [];
   for (const m of available) {
-    // allowlist AND live-copilot-filter both apply; neither bypasses the other.
+    // allowlist AND both live filters apply; none bypasses the others.
     if (allow && !allow.has(`${m.provider}/${m.id}`)) continue;
     if (copilotFilter && m.provider === "github-copilot" && !copilotFilter.has(m.id)) continue;
+    if (anthropicFilter && m.provider === "anthropic" && !anthropicFilter.has(m.id)) continue;
+    if (omlxFilter && m.provider === "omlx" && !omlxFilter.has(m.id)) continue;
     out.push({
       provider: m.provider,
       id: m.id,

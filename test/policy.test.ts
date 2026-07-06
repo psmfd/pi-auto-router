@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { Candidate } from "../shared/candidates.ts";
+import type { RoutingMatrix } from "../shared/routing-matrix.ts";
 import {
   buildHint,
   buildRoutingPrompt,
+  costRank,
   orderClassifierModels,
+  resolveByTaskType,
   resolveChoice,
   type PolicyContext,
 } from "../policy.ts";
@@ -86,6 +89,41 @@ test("orderClassifierModels puts the configured model first when available", () 
   assert.deepEqual(orderClassifierModels(cands, "anthropic/missing").map((c) => c.id), ["haiku", "opus"]);
 });
 
+// --- #363: cost-0 local workhorse in the classifier rotation ----------------
+// Decision recorded for #519's ADR: the cost stays an honest 0 (no nominal
+// fudge — that would corrupt the #351/#520 observed-cost data), so the local
+// model leads the classifier rotation by design; `classifierModel` in
+// state.json remains the explicit-pin escape hatch.
+
+test("a cost-0 local workhorse sorts ahead of priced models as classifier (#363)", () => {
+  const cands = [
+    cand("anthropic", "opus", 5),
+    cand("omlx", "coding-workhorse", 0, 131_072),
+    cand("anthropic", "haiku", 0.8),
+  ];
+  assert.deepEqual(orderClassifierModels(cands, null).map((c) => `${c.provider}/${c.id}`), [
+    "omlx/coding-workhorse",
+    "anthropic/haiku",
+    "anthropic/opus",
+  ]);
+});
+
+test("cost-0 ties break smallest-window-first (a 128k copilot edges the 131k workhorse)", () => {
+  // Both cost 0 ⇒ the tiebreak is contextWindow ascending. This is accepted:
+  // whichever cost-0 model classifies, the call is free; the pin is the lever
+  // for operators who want determinism.
+  const cands = [cand("omlx", "coding-workhorse", 0, 131_072), cand("github-copilot", "gpt-5.5-mini", 0, 128_000)];
+  assert.deepEqual(orderClassifierModels(cands, null).map((c) => c.id), ["gpt-5.5-mini", "coding-workhorse"]);
+});
+
+test("an explicit classifierModel pin overrides the cost-0 default (#363)", () => {
+  const cands = [cand("omlx", "coding-workhorse", 0, 131_072), cand("anthropic", "haiku", 0.8)];
+  assert.deepEqual(orderClassifierModels(cands, "anthropic/haiku").map((c) => c.id), [
+    "haiku",
+    "coding-workhorse",
+  ]);
+});
+
 test("buildRoutingPrompt excludes denied models from the menu", async () => {
   const built = await buildRoutingPrompt(
     ctx([cand("anthropic", "opus", 5), cand("anthropic", "haiku", 0.8)]),
@@ -106,4 +144,92 @@ test("buildRoutingPrompt reports all-unavailable when every candidate is denied"
     new Set(["anthropic/haiku"]),
   );
   assert.deepEqual(denied, { ok: false, reason: "all-unavailable" });
+});
+
+// --- #352: resolveByTaskType (deterministic capability-matrix pick) ---------
+
+const M = (models: Record<string, { capable: string[] }>): RoutingMatrix => ({
+  v: 1,
+  lastReviewed: "2026-07-06",
+  models,
+});
+
+/** cand() prices output at input*4, so costRank = input + 4*input = 5*input. */
+const THREE = [cand("omlx", "workhorse", 0, 131_072), cand("anthropic", "haiku", 0.8), cand("anthropic", "opus", 5)];
+const ALL_CAPABLE = M({
+  "omlx/workhorse": { capable: ["code-edit"] },
+  "anthropic/haiku": { capable: ["code-edit"] },
+  "anthropic/opus": { capable: ["code-edit"] },
+});
+const NONE = new Set<string>();
+
+test("resolveByTaskType returns the cheapest capable candidate by input + k·output", () => {
+  const pick = resolveByTaskType(THREE, "code-edit", ALL_CAPABLE, NONE, null);
+  assert.equal(pick && `${pick.provider}/${pick.id}`, "omlx/workhorse");
+});
+
+test("resolveByTaskType null paths: no matrix, unknown type, empty capable set, no overlap", () => {
+  assert.equal(resolveByTaskType(THREE, "code-edit", null, NONE, null), null);
+  assert.equal(resolveByTaskType(THREE, "unknown", ALL_CAPABLE, NONE, null), null);
+  assert.equal(resolveByTaskType(THREE, "creative", ALL_CAPABLE, NONE, null), null);
+  assert.equal(resolveByTaskType(THREE, "code-edit", M({ "ghost/model": { capable: ["code-edit"] } }), NONE, null), null);
+  assert.equal(resolveByTaskType([], "code-edit", ALL_CAPABLE, NONE, null), null);
+});
+
+test("resolveByTaskType enforces the capability floor before cost (closed world)", () => {
+  // opus is the ONLY capable model — the cheaper workhorse/haiku must not win.
+  const onlyOpus = M({ "anthropic/opus": { capable: ["code-edit"] } });
+  const pick = resolveByTaskType(THREE, "code-edit", onlyOpus, NONE, null);
+  assert.equal(pick && `${pick.provider}/${pick.id}`, "anthropic/opus");
+});
+
+test("resolveByTaskType excludes unavailable models even when capable and cheapest", () => {
+  const pick = resolveByTaskType(THREE, "code-edit", ALL_CAPABLE, new Set(["omlx/workhorse"]), null);
+  assert.equal(pick && `${pick.provider}/${pick.id}`, "anthropic/haiku");
+  assert.equal(
+    resolveByTaskType(THREE, "code-edit", ALL_CAPABLE, new Set(THREE.map((c) => `${c.provider}/${c.id}`)), null),
+    null,
+  );
+});
+
+test("resolveByTaskType filters window-inadequate candidates before cost-rank", () => {
+  // 120k tokens: the workhorse (131_072 window) is past FORCE_COMPACT_AT (90%)
+  // on its own window — excluded despite being free; haiku (200k) wins.
+  const usage = { tokens: 120_000, window: 200_000, pct: 0.6, level: "ok" as const };
+  const pick = resolveByTaskType(THREE, "code-edit", ALL_CAPABLE, NONE, usage);
+  assert.equal(pick && `${pick.provider}/${pick.id}`, "anthropic/haiku");
+  // usage unknown (null) fails open: the workhorse is selectable again.
+  const open = resolveByTaskType(THREE, "code-edit", ALL_CAPABLE, NONE, null);
+  assert.equal(open && `${open.provider}/${open.id}`, "omlx/workhorse");
+  // every capable candidate inadequate → null (fallback, never a bad pick).
+  const huge = { tokens: 190_000, window: 200_000, pct: 0.95, level: "force" as const };
+  assert.equal(resolveByTaskType(THREE, "code-edit", ALL_CAPABLE, NONE, huge), null);
+});
+
+test("resolveByTaskType tiebreak is deterministic: window, then provider/id", () => {
+  // Same scalar (both free): smaller window wins.
+  const a = cand("prov-a", "small", 0, 100_000);
+  const b = cand("prov-b", "big", 0, 200_000);
+  const m = M({ "prov-a/small": { capable: ["simple-qa"] }, "prov-b/big": { capable: ["simple-qa"] } });
+  const pick = resolveByTaskType([b, a], "simple-qa", m, NONE, null);
+  assert.equal(pick && `${pick.provider}/${pick.id}`, "prov-a/small");
+  // Same scalar AND window: provider/id string order — menu order irrelevant.
+  const c1 = cand("prov-a", "zed", 0, 100_000);
+  const c2 = cand("prov-a", "alpha", 0, 100_000);
+  const m2 = M({ "prov-a/zed": { capable: ["simple-qa"] }, "prov-a/alpha": { capable: ["simple-qa"] } });
+  const t1 = resolveByTaskType([c1, c2], "simple-qa", m2, NONE, null);
+  const t2 = resolveByTaskType([c2, c1], "simple-qa", m2, NONE, null);
+  assert.equal(t1 && `${t1.provider}/${t1.id}`, "prov-a/alpha");
+  assert.equal(t2 && `${t2.provider}/${t2.id}`, "prov-a/alpha");
+});
+
+test("costRank weights output by k=1 (not input-only like orderClassifierModels)", () => {
+  // cheapIn: input 1, output 20 → rank 21. dearIn: input 2, output 4 → rank 6.
+  const cheapIn: Candidate = { provider: "p", id: "cheap-in", contextWindow: 200_000, cost: { input: 1, output: 20, cacheRead: 0, cacheWrite: 0 } };
+  const dearIn: Candidate = { provider: "p", id: "dear-in", contextWindow: 200_000, cost: { input: 2, output: 4, cacheRead: 0, cacheWrite: 0 } };
+  assert.equal(costRank(cheapIn), 21);
+  assert.equal(costRank(dearIn), 6);
+  const m = M({ "p/cheap-in": { capable: ["simple-qa"] }, "p/dear-in": { capable: ["simple-qa"] } });
+  const pick = resolveByTaskType([cheapIn, dearIn], "simple-qa", m, NONE, null);
+  assert.equal(pick && pick.id, "dear-in");
 });

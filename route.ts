@@ -5,15 +5,27 @@
  * caller (before_agent_start) can stay a thin never-throws wrapper.
  *
  * Fallback discipline: every failure path keeps the current model. The router
- * only ever *narrows* to a credentialed candidate the classifier picked.
+ * only ever *narrows* to a credentialed candidate from the live-filtered menu —
+ * either the classifier's pick or (matrix routing enabled, #352) the
+ * deterministic capability-matrix pick, both validated through the same gates.
  */
 
 import type { NotifyContext } from "./shared/notify.ts";
+import type { RoutingMatrix } from "./shared/routing-matrix.ts";
+import { getUsage } from "./shared/signals.ts";
+import { resolveAnthropicFilter } from "./anthropic-discovery.ts";
 import { classify, type ClassifierChoice, type CompleteFn } from "./classifier.ts";
-import { resolveCopilotFilter, type FetchLike } from "./copilot-discovery.ts";
-import { buildRoutingPrompt, orderClassifierModels, resolveChoice, type PolicyContext } from "./policy.ts";
-import { hashPrompt, type DecisionCache, type RouterState } from "./state.ts";
-import type { Auth, RouterModel } from "./types.ts";
+import { resolveCopilotFilter, type FetchLike } from "./shared/copilot-discovery.ts";
+import { resolveOmlxFilter } from "./shared/omlx-discovery.ts";
+import {
+  buildRoutingPrompt,
+  orderClassifierModels,
+  resolveByTaskType,
+  resolveChoice,
+  type PolicyContext,
+} from "./policy.ts";
+import { hashPrompt, type CachedDecision, type DecisionCache, type RouterState } from "./state.ts";
+import type { Auth, PickSource, RouterModel, TaskType } from "./types.ts";
 
 export interface RouteContext extends PolicyContext, NotifyContext {
   readonly model?: RouterModel | undefined;
@@ -41,7 +53,16 @@ export type RouteOutcome =
   | { readonly kind: "unresolved"; readonly choice: string }
   | { readonly kind: "no-registry-model"; readonly target: string }
   | { readonly kind: "no-credential"; readonly target: string }
-  | { readonly kind: "routed"; readonly target: string; readonly cached: boolean; readonly reason?: string };
+  | {
+      readonly kind: "routed";
+      readonly target: string;
+      readonly cached: boolean;
+      /** Measurement-only task-type label from the (possibly cached) classification (#351). */
+      readonly taskType: TaskType;
+      /** Whether the matrix or the classifier produced the target (#352). */
+      readonly source: PickSource;
+      readonly reason?: string;
+    };
 
 export interface RouteDeps {
   readonly completeFn?: CompleteFn;
@@ -59,28 +80,43 @@ export async function route(
   ctx: RouteContext,
   prompt: string,
   cfg: RouterState,
+  matrix: RoutingMatrix | null,
   cache: DecisionCache,
   unavailable: Set<string>,
   deps: RouteDeps = {},
 ): Promise<RouteOutcome> {
   const key = hashPrompt(prompt);
-  let target = cache.get(key);
+  let decision: CachedDecision | undefined = cache.get(key);
   // A cached target that went unavailable earlier this session (e.g. 429'd) must
   // NOT be reused — drop it and re-classify. The in-loop guard below only
   // protects the fresh-classification path; without this a cache hit would route
   // the real turn straight to a quota-dead model. The re-classification's
   // buildRoutingPrompt excludes `unavailable`, and cache.set() overwrites the
   // stale entry with the fresh choice.
-  if (target !== undefined && unavailable.has(target)) {
-    target = undefined;
+  if (decision !== undefined && unavailable.has(decision.target)) {
+    decision = undefined;
   }
-  let cached = target !== undefined;
+  let cached = decision !== undefined;
   let reason: string | undefined;
 
-  if (target === undefined) {
+  if (decision === undefined) {
     // Live Copilot availability: drop tier-gated/picker-disabled github-copilot
     // models the static catalog over-reports. Fails open to null (static menu).
     const copilotFilter = await resolveCopilotFilter(ctx, {
+      ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
+      ...(ctx.signal ? { signal: ctx.signal } : {}),
+    }).catch(() => null);
+
+    // Live Anthropic availability (#538): drop retired ids the static registry
+    // still lists (they 404 when routed). Fails open to null.
+    const anthropicFilter = await resolveAnthropicFilter(ctx, {
+      ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
+      ...(ctx.signal ? { signal: ctx.signal } : {}),
+    }).catch(() => null);
+
+    // Live oMLX availability (#364): drop the local candidate when the server
+    // is confirmed down or the model is not loaded. Fails open to null.
+    const omlxFilter = await resolveOmlxFilter(ctx, {
       ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
       ...(ctx.signal ? { signal: ctx.signal } : {}),
     }).catch(() => null);
@@ -89,7 +125,7 @@ export async function route(
     const built = await buildRoutingPrompt(
       ctx,
       prompt,
-      { allowlist: cfg.allowlist, copilotFilter },
+      { allowlist: cfg.allowlist, copilotFilter, anthropicFilter, omlxFilter },
       unavailable,
     );
     if (!built.ok) return { kind: "no-candidates", reason: built.reason };
@@ -130,12 +166,40 @@ export async function route(
       return { kind: "unresolved", choice: choice.model };
     }
 
-    target = `${cand.provider}/${cand.id}`;
+    let target = `${cand.provider}/${cand.id}`;
+    let source: PickSource = "classifier";
+
+    // #352 (ADR-0078): when enabled, the deterministic capability-matrix pick
+    // overrides the classifier's model choice (its taskType label is kept).
+    // The pick consumes the same live-filtered menu the classifier saw, and is
+    // re-validated through the SAME gates as the classifier path — resolveChoice
+    // plus a post-classify-loop `unavailable` check (the loop can 429 a model
+    // AFTER built.candidates was computed). A null pick means "no capable,
+    // available, window-adequate candidate": the classifier's target stands.
+    if (cfg.matrixEnabled && matrix) {
+      const pick = resolveByTaskType(
+        built.candidates,
+        choice.taskType,
+        matrix,
+        unavailable,
+        getUsage(ctx),
+      );
+      if (pick) {
+        const revalidated = resolveChoice(built.candidates, `${pick.provider}/${pick.id}`);
+        if (revalidated && !unavailable.has(`${revalidated.provider}/${revalidated.id}`)) {
+          target = `${revalidated.provider}/${revalidated.id}`;
+          source = "matrix";
+        }
+      }
+    }
+
+    decision = { target, taskType: choice.taskType, source };
     reason = choice.reason;
-    cache.set(key, target);
+    cache.set(key, decision);
     cached = false;
   }
 
+  const { target, taskType, source } = decision;
   const { provider, id } = splitTarget(target);
   const model = ctx.modelRegistry.find(provider, id);
   if (!model) return { kind: "no-registry-model", target };
@@ -143,6 +207,6 @@ export async function route(
   const ok = await pi.setModel(model);
   if (!ok) return { kind: "no-credential", target };
   return reason === undefined
-    ? { kind: "routed", target, cached }
-    : { kind: "routed", target, cached, reason };
+    ? { kind: "routed", target, cached, taskType, source }
+    : { kind: "routed", target, cached, taskType, source, reason };
 }

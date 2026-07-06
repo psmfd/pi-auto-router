@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "description": "Hand-authored capability floor per task type (#350/#363): which models clear the bar for each task-type label emitted by the auto-router classifier. Consulted by auto-router's resolveByTaskType since #352 (ADR-0078) when matrix routing is enabled (the default since #353/ADR-0079; /auto matrix off opts out). Closed-world for matrix picks: a model absent here is never a matrix pick, though the classifier may still choose it — so absence never removes a model from routing. Cost-ranking (input + k*output, k=1) happens only WITHIN a capable set, so this floor can never race to the bottom. Task types are the closed taxonomy in auto-router/types.ts TASK_TYPES. Human-reviewed, never auto-written (mirrors the #344 cost-table posture): update capable sets only with a rationale and a fresh lastReviewed.",
+  "lastReviewed": "2026-07-06",
+  "models": {
+    "omlx/coding-workhorse": {
+      "capable": ["simple-qa", "code-edit", "code-review", "agentic-loop"],
+      "rationale": "GLM-4.7-Flash-6bit, the sole pinned oMLX resident (local-llm ADR-009/010): tool-call-strong, text-only, designed for read-only subagent fan-out (reads/edits, search, codegen, summarization, tool-calling) — hence agentic-loop and the code types. NOT long-context despite the 202K native window: sustained concurrency (mark of 8, ADR-010) is prefill-activation-bound and falls as context grows; the sustained mark was validated at ~16K-token prefixes, and the pi registration deliberately caps contextWindow at 131072 — long-context work goes to the frontier. NOT creative: quality-tier work is deliberately not served locally (ADR-009)."
+    }
+  }
+}

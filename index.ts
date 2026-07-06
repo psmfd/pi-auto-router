@@ -14,9 +14,15 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { clearCopilotCache } from "./copilot-discovery.ts";
+import { loadRoutingMatrix, type RoutingMatrix } from "./shared/routing-matrix.ts";
+import { clearAnthropicCache } from "./anthropic-discovery.ts";
+import { hasExplicitModelFlag } from "./argv-guard.ts";
+import { clearCopilotCache } from "./shared/copilot-discovery.ts";
+import { clearOmlxCache } from "./shared/omlx-discovery.ts";
+import { appendTaskRecord, buildTaskRecord, type AssistantMessageLike } from "./recorder.ts";
 import { route, type RouteContext, type RouteOutcome, type RoutePi } from "./route.ts";
 import * as state from "./state.ts";
+import type { PickSource, TaskType } from "./types.ts";
 
 /** Persistent status-bar segment showing the model currently in use. */
 function showModel(ctx: ExtensionContext, provider: string, id: string): void {
@@ -34,7 +40,7 @@ function feedback(ctx: ExtensionContext, outcome: RouteOutcome): void {
   switch (outcome.kind) {
     case "routed":
       ctx.ui.notify(
-        `auto-router: routed → ${outcome.target}${outcome.cached ? " (cached)" : ""}` +
+        `auto-router: routed → ${outcome.target} [${outcome.source}]${outcome.cached ? " (cached)" : ""}` +
           `${outcome.reason ? ` — ${outcome.reason}` : ""}`,
         "info",
       );
@@ -83,9 +89,26 @@ function feedback(ctx: ExtensionContext, outcome: RouteOutcome): void {
 export default function autoRouter(pi: ExtensionAPI): void {
   let cfg: state.RouterState = state.DEFAULT_STATE;
   const cache = new state.DecisionCache();
+  // The hand-authored capability floor (#352, ADR-0078): loaded per session,
+  // null when missing/malformed (matrix routing degrades to classifier picks).
+  let matrix: RoutingMatrix | null = null;
   // `provider/id`s that returned a provider error (e.g. 429) this session — skipped
   // as both classifier and routing targets until the next session.
   const unavailable = new Set<string>();
+  // #351 measurement pipeline: the routed prompt's task-type label (plus the
+  // #352 matrix/classifier source), STICKY across every assistant
+  // `message_end` until the next routing attempt — an agentic turn produces
+  // many assistant messages, and labeling only the first would understate
+  // exactly the task types the #352 matrix must cost honestly. Any non-routed
+  // turn (routing off, fallback outcome, route error) clears the label so
+  // unrouted usage is never misattributed.
+  let pendingLabel: { readonly taskType: TaskType; readonly source: PickSource } | null = null;
+  let turn = 0;
+  // #519 precedence guard: an explicit argv --model wins over routing for the
+  // whole process lifetime (argv never changes). Computed once; the notify is
+  // one-time so an agentic session is not toasted every turn.
+  const explicitModel = hasExplicitModelFlag();
+  let explicitModelNotified = false;
 
   pi.registerFlag("auto", {
     description: "Enable per-prompt auto model routing for this session",
@@ -95,44 +118,120 @@ export default function autoRouter(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     cfg = await state.load();
+    matrix = await loadRoutingMatrix(); // per-session reload: edits apply next session (#352)
     unavailable.clear(); // give quota-recovered models a fresh chance each session
     clearCopilotCache(); // re-discover live Copilot availability each session
+    clearAnthropicCache(); // re-discover live Anthropic availability each session (#538)
+    clearOmlxCache(); // re-probe local oMLX availability each session (#364)
+    pendingLabel = null;
+    turn = 0;
     if (ctx.model) showModel(ctx, ctx.model.provider, ctx.model.id);
   });
 
   pi.registerCommand("auto", {
-    description: "Auto model routing: /auto [on|off|status]",
+    description: "Auto model routing: /auto [on|off|status|matrix on|matrix off]",
     handler: async (args, ctx) => {
-      const sub = (args ?? "").trim().toLowerCase();
+      const parts = (args ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+      if (parts[0] === "matrix") {
+        // #352 (ADR-0078): toggle the deterministic capability-matrix override.
+        const sub = parts[1];
+        if (sub === "on" || sub === "off") {
+          cfg = { ...cfg, matrixEnabled: sub === "on" };
+          await state.save(cfg);
+          // A prompt hash carries no dependency on the flag — decisions cached
+          // under the other mode would replay stale picks. Drop them all.
+          cache.clear();
+        }
+        ctx.ui.notify(
+          `auto-router: matrix ${cfg.matrixEnabled ? "ON" : "OFF"}` +
+            (matrix ? "" : " (routing-matrix.json not loaded — classifier picks apply)"),
+          "info",
+        );
+        return;
+      }
+      const sub = parts[0] ?? "";
       if (sub === "on" || sub === "off") {
         cfg = { ...cfg, enabled: sub === "on" };
         await state.save(cfg);
       }
       const flagOn = pi.getFlag("auto") === true;
       const active = cfg.enabled || flagOn;
+      const inert = active && explicitModel ? " (inert: explicit --model)" : "";
       ctx.ui.notify(
-        `auto-router: ${active ? "ON" : "OFF"}${flagOn && !cfg.enabled ? " (via --auto)" : ""}; ` +
-          `classifier=${cfg.classifierModel ?? "cheapest-available"}`,
+        `auto-router: ${active ? "ON" : "OFF"}${flagOn && !cfg.enabled ? " (via --auto)" : ""}${inert}; ` +
+          `classifier=${cfg.classifierModel ?? "cheapest-available"}; ` +
+          `matrix=${cfg.matrixEnabled ? "on" : "off"}`,
         "info",
       );
     },
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
-    if (!cfg.enabled && pi.getFlag("auto") !== true) return;
+    if (!cfg.enabled && pi.getFlag("auto") !== true) {
+      // Routing off ⇒ this turn is unrouted; drop any sticky label so its
+      // usage is never attributed to a previous turn's task type.
+      pendingLabel = null;
+      return;
+    }
+    if (explicitModel) {
+      // Explicit --model on argv (#519): routing is inert for this process —
+      // short-circuit BEFORE the classifier side-call and discovery probes, so
+      // a pinned subagent child pays none of the routing cost the pin exists
+      // to avoid. The turn is unrouted for measurement purposes.
+      pendingLabel = null;
+      if (!explicitModelNotified && ctx.hasUI) {
+        explicitModelNotified = true;
+        ctx.ui.notify(
+          "auto-router: explicit --model on the command line; routing is inert for this session",
+          "info",
+        );
+      }
+      return;
+    }
     try {
       const outcome = await route(
         pi as unknown as RoutePi,
         ctx as unknown as RouteContext,
         event.prompt,
         cfg,
+        matrix,
         cache,
         unavailable,
       );
+      pendingLabel =
+        outcome.kind === "routed"
+          ? { taskType: outcome.taskType, source: outcome.source }
+          : null;
       feedback(ctx, outcome);
     } catch {
-      // Routing must never block a turn.
+      // Routing must never block a turn. The label is cleared too: a turn
+      // whose route errored must not be recorded under the previous label.
+      pendingLabel = null;
     }
+  });
+
+  pi.on("message_end", async (event, ctx) => {
+    // #351 recorder: observational only — always returns undefined, never a
+    // replacement message, and never lets an I/O failure disturb the turn.
+    try {
+      const message = (event as unknown as { message?: AssistantMessageLike }).message;
+      if (!message || message.role !== "assistant") return undefined;
+      turn += 1;
+      if (pendingLabel === null) return undefined;
+      const record = buildTaskRecord(pendingLabel.taskType, pendingLabel.source, message, {
+        ts: new Date().toISOString(),
+        turn,
+        providerFallback:
+          (ctx as unknown as { model?: { provider?: string } }).model?.provider ?? "unknown",
+      });
+      // Deliberately NOT cleared: the label stays sticky so every assistant
+      // message of an agentic turn is recorded; the next routing attempt
+      // (or a non-routed turn) replaces or clears it.
+      if (record) await appendTaskRecord(record);
+    } catch {
+      // Measurement must never disturb a turn.
+    }
+    return undefined;
   });
 
   pi.on("model_select", (event, ctx) => {

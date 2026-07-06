@@ -2,13 +2,15 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { RegistryModel } from "../shared/candidates.ts";
+import type { RoutingMatrix } from "../shared/routing-matrix.ts";
 import type { CompleteFn } from "../classifier.ts";
-import { clearCopilotCache, type FetchLike } from "../copilot-discovery.ts";
+import { clearCopilotCache, type FetchLike } from "../shared/copilot-discovery.ts";
 import { route, type RouteContext, type RoutePi } from "../route.ts";
 import { DecisionCache, type RouterState } from "../state.ts";
 import type { Auth, RouterModel } from "../types.ts";
 
-const CFG: RouterState = { enabled: true, classifierModel: null, allowlist: [] };
+const CFG: RouterState = { enabled: true, classifierModel: null, allowlist: [], matrixEnabled: false };
+const CFG_MATRIX: RouterState = { ...CFG, matrixEnabled: true };
 
 function mkModel(provider: string, id: string): RouterModel {
   return { provider, id } as unknown as RouterModel;
@@ -64,11 +66,32 @@ function completeReturning(text: string): CompleteFn {
 
 test("routes to the classifier's chosen credentialed model", async () => {
   const pi = makePi(true);
-  const out = await route(pi, makeCtx(), "big refactor", CFG, new DecisionCache(), new Set(), {
+  const out = await route(pi, makeCtx(), "big refactor", CFG, null, new DecisionCache(), new Set(), {
     completeFn: completeReturning('{"model":"anthropic/opus","reason":"x"}'),
   });
-  assert.deepEqual(out, { kind: "routed", target: "anthropic/opus", cached: false, reason: "x" });
+  assert.deepEqual(out, { kind: "routed", target: "anthropic/opus", cached: false, source: "classifier", taskType: "unknown", reason: "x" });
   assert.equal(pi.calls.length, 1);
+});
+
+test("routed outcome carries the classifier's taskType label (#351)", async () => {
+  const out = await route(makePi(true), makeCtx(), "fix the bug", CFG, null, new DecisionCache(), new Set(), {
+    completeFn: completeReturning('{"taskType":"code-edit","model":"anthropic/opus","reason":"x"}'),
+  });
+  assert.deepEqual(out, {
+    kind: "routed", target: "anthropic/opus", cached: false, source: "classifier", taskType: "code-edit", reason: "x",
+  });
+});
+
+test("a cache hit retains the taskType from the original classification (#351)", async () => {
+  const pi = makePi(true);
+  const ctx = makeCtx();
+  const cache = new DecisionCache();
+  const cf = completeReturning('{"taskType":"code-review","model":"anthropic/opus","reason":"r"}');
+  await route(pi, ctx, "review this diff", CFG, null, cache, new Set(), { completeFn: cf });
+  const out = await route(pi, ctx, "review this diff", CFG, null, cache, new Set(), { completeFn: cf });
+  assert.deepEqual(out, {
+    kind: "routed", target: "anthropic/opus", cached: true, source: "classifier", taskType: "code-review",
+  });
 });
 
 test("serves identical prompts from the decision cache without re-classifying", async () => {
@@ -81,10 +104,10 @@ test("serves identical prompts from the decision cache without re-classifying", 
     calls += 1;
     return { content: [{ type: "text", text: '{"model":"anthropic/opus"}' }] };
   };
-  await route(pi, ctx, "same prompt", CFG, cache, unavailable, { completeFn: cf });
-  const out2 = await route(pi, ctx, "same prompt", CFG, cache, unavailable, { completeFn: cf });
+  await route(pi, ctx, "same prompt", CFG, null, cache, unavailable, { completeFn: cf });
+  const out2 = await route(pi, ctx, "same prompt", CFG, null, cache, unavailable, { completeFn: cf });
   assert.equal(calls, 1);
-  assert.deepEqual(out2, { kind: "routed", target: "anthropic/opus", cached: true });
+  assert.deepEqual(out2, { kind: "routed", target: "anthropic/opus", cached: true, source: "classifier", taskType: "unknown" });
 });
 
 test("a cached target that went unavailable is re-classified, not reused", async () => {
@@ -93,37 +116,37 @@ test("a cached target that went unavailable is re-classified, not reused", async
   const cache = new DecisionCache();
   const unavailable = new Set<string>();
   // First turn caches anthropic/opus.
-  await route(pi, ctx, "p", CFG, cache, unavailable, {
+  await route(pi, ctx, "p", CFG, null, cache, unavailable, {
     completeFn: completeReturning('{"model":"anthropic/opus","reason":"a"}'),
   });
   // opus 429s out-of-band this session; the same prompt must NOT be served the
   // dead cached opus — it must re-classify (and the menu now excludes opus).
   unavailable.add("anthropic/opus");
-  const out = await route(pi, ctx, "p", CFG, cache, unavailable, {
+  const out = await route(pi, ctx, "p", CFG, null, cache, unavailable, {
     completeFn: completeReturning('{"model":"anthropic/haiku","reason":"b"}'),
   });
-  assert.deepEqual(out, { kind: "routed", target: "anthropic/haiku", cached: false, reason: "b" });
+  assert.deepEqual(out, { kind: "routed", target: "anthropic/haiku", cached: false, source: "classifier", taskType: "unknown", reason: "b" });
 });
 
 test("skips a classifier candidate absent from the registry and fails over", async () => {
   // haiku (cheapest) is not in the registry as a classifier model → "not-in-registry";
   // the loop fails over to opus, which answers.
-  const out = await route(makePi(true), makeCtx({ findUndefinedFor: "anthropic/haiku" }), "hi", CFG, new DecisionCache(), new Set(), {
+  const out = await route(makePi(true), makeCtx({ findUndefinedFor: "anthropic/haiku" }), "hi", CFG, null, new DecisionCache(), new Set(), {
     completeFn: completeReturning('{"model":"anthropic/opus","reason":"x"}'),
   });
-  assert.deepEqual(out, { kind: "routed", target: "anthropic/opus", cached: false, reason: "x" });
+  assert.deepEqual(out, { kind: "routed", target: "anthropic/opus", cached: false, source: "classifier", taskType: "unknown", reason: "x" });
 });
 
 test("returns no-registry-model when the resolved target is absent from the registry", async () => {
   // The haiku classifier picks opus, but opus is not findable as a routable model.
-  const out = await route(makePi(), makeCtx({ findUndefinedFor: "anthropic/opus" }), "hi", CFG, new DecisionCache(), new Set(), {
+  const out = await route(makePi(), makeCtx({ findUndefinedFor: "anthropic/opus" }), "hi", CFG, null, new DecisionCache(), new Set(), {
     completeFn: completeReturning('{"model":"anthropic/opus","reason":"x"}'),
   });
   assert.deepEqual(out, { kind: "no-registry-model", target: "anthropic/opus" });
 });
 
 test("returns no-candidates when nothing is credentialed", async () => {
-  const out = await route(makePi(), makeCtx({ available: [] }), "hi", CFG, new DecisionCache(), new Set(), {
+  const out = await route(makePi(), makeCtx({ available: [] }), "hi", CFG, null, new DecisionCache(), new Set(), {
     completeFn: completeReturning("{}"),
   });
   assert.deepEqual(out, { kind: "no-candidates", reason: "none-credentialed" });
@@ -131,7 +154,7 @@ test("returns no-candidates when nothing is credentialed", async () => {
 
 test("falls back (no setModel) when every candidate returns no JSON", async () => {
   const pi = makePi();
-  const out = await route(pi, makeCtx(), "hi", CFG, new DecisionCache(), new Set(), {
+  const out = await route(pi, makeCtx(), "hi", CFG, null, new DecisionCache(), new Set(), {
     completeFn: completeReturning("I cannot decide"),
   });
   assert.equal(out.kind, "classify-failed");
@@ -139,7 +162,7 @@ test("falls back (no setModel) when every candidate returns no JSON", async () =
 });
 
 test("returns unresolved when the choice is not a credentialed candidate", async () => {
-  const out = await route(makePi(), makeCtx(), "hi", CFG, new DecisionCache(), new Set(), {
+  const out = await route(makePi(), makeCtx(), "hi", CFG, null, new DecisionCache(), new Set(), {
     completeFn: completeReturning('{"model":"ghost/model"}'),
   });
   assert.deepEqual(out, { kind: "unresolved", choice: "ghost/model" });
@@ -147,14 +170,14 @@ test("returns unresolved when the choice is not a credentialed candidate", async
 
 test("reports no-credential (no throw) when setModel returns false", async () => {
   const pi = makePi(false);
-  const out = await route(pi, makeCtx(), "hi", CFG, new DecisionCache(), new Set(), {
+  const out = await route(pi, makeCtx(), "hi", CFG, null, new DecisionCache(), new Set(), {
     completeFn: completeReturning('{"model":"anthropic/opus"}'),
   });
   assert.deepEqual(out, { kind: "no-credential", target: "anthropic/opus" });
 });
 
 test("falls back when the classifier model has no credential", async () => {
-  const out = await route(makePi(), makeCtx({ auth: { ok: false } }), "hi", CFG, new DecisionCache(), new Set(), {
+  const out = await route(makePi(), makeCtx({ auth: { ok: false } }), "hi", CFG, null, new DecisionCache(), new Set(), {
     completeFn: completeReturning('{"model":"anthropic/opus"}'),
   });
   assert.equal(out.kind, "classify-failed");
@@ -168,8 +191,8 @@ test("fails over to the next classifier model on a provider error (e.g. 429)", a
     if (modelId(model) === "haiku") throw new Error("OpenAI API error (429): quota exceeded");
     return { content: [{ type: "text", text: '{"model":"anthropic/opus","reason":"x"}' }] };
   };
-  const out = await route(pi, makeCtx(), "hi", CFG, new DecisionCache(), unavailable, { completeFn: cf });
-  assert.deepEqual(out, { kind: "routed", target: "anthropic/opus", cached: false, reason: "x" });
+  const out = await route(pi, makeCtx(), "hi", CFG, null, new DecisionCache(), unavailable, { completeFn: cf });
+  assert.deepEqual(out, { kind: "routed", target: "anthropic/opus", cached: false, source: "classifier", taskType: "unknown", reason: "x" });
   assert.equal(unavailable.has("anthropic/haiku"), true);
   assert.equal(unavailable.has("anthropic/opus"), false);
 });
@@ -179,7 +202,7 @@ test("exhausts the list and marks every unavailable model when all fail over", a
   const cf: CompleteFn = async () => {
     throw new Error("429 quota exceeded");
   };
-  const out = await route(makePi(), makeCtx(), "hi", CFG, new DecisionCache(), unavailable, { completeFn: cf });
+  const out = await route(makePi(), makeCtx(), "hi", CFG, null, new DecisionCache(), unavailable, { completeFn: cf });
   assert.deepEqual(out, {
     kind: "classify-failed",
     attempts: [
@@ -193,7 +216,7 @@ test("exhausts the list and marks every unavailable model when all fail over", a
 
 test("excludes already-unavailable models from the menu", async () => {
   const unavailable = new Set(["anthropic/haiku", "anthropic/opus"]);
-  const out = await route(makePi(), makeCtx(), "hi", CFG, new DecisionCache(), unavailable, {
+  const out = await route(makePi(), makeCtx(), "hi", CFG, null, new DecisionCache(), unavailable, {
     completeFn: completeReturning('{"model":"anthropic/opus"}'),
   });
   assert.deepEqual(out, { kind: "no-candidates", reason: "all-unavailable" });
@@ -216,7 +239,7 @@ test("drops a Copilot model the live /models set excludes (the gpt-5.4-nano bug)
   clearCopilotCache();
   // The classifier 'picks' the phantom; with the filter active it is not in the
   // menu, so resolveChoice fails rather than routing the real turn to a 400.
-  const out = await route(makePi(), makeCtx(COPILOT_CTX), "hi", CFG, new DecisionCache(), new Set(), {
+  const out = await route(makePi(), makeCtx(COPILOT_CTX), "hi", CFG, null, new DecisionCache(), new Set(), {
     completeFn: completeReturning('{"model":"github-copilot/gpt-5.4-nano"}'),
     fetchFn: onlyGpt55,
   });
@@ -226,21 +249,84 @@ test("drops a Copilot model the live /models set excludes (the gpt-5.4-nano bug)
 
 test("routes to a Copilot model that IS picker-enabled", async () => {
   clearCopilotCache();
-  const out = await route(makePi(), makeCtx(COPILOT_CTX), "hi", CFG, new DecisionCache(), new Set(), {
+  const out = await route(makePi(), makeCtx(COPILOT_CTX), "hi", CFG, null, new DecisionCache(), new Set(), {
     completeFn: completeReturning('{"model":"github-copilot/gpt-5.5","reason":"ok"}'),
     fetchFn: onlyGpt55,
   });
-  assert.deepEqual(out, { kind: "routed", target: "github-copilot/gpt-5.5", cached: false, reason: "ok" });
+  assert.deepEqual(out, { kind: "routed", target: "github-copilot/gpt-5.5", cached: false, source: "classifier", taskType: "unknown", reason: "ok" });
   clearCopilotCache();
 });
 
 test("fails open: a /models error leaves the static menu (nano stays routable)", async () => {
   clearCopilotCache();
   const throwing: FetchLike = async () => { throw new Error("network"); };
-  const out = await route(makePi(), makeCtx(COPILOT_CTX), "hi", CFG, new DecisionCache(), new Set(), {
+  const out = await route(makePi(), makeCtx(COPILOT_CTX), "hi", CFG, null, new DecisionCache(), new Set(), {
     completeFn: completeReturning('{"model":"github-copilot/gpt-5.4-nano","reason":"x"}'),
     fetchFn: throwing,
   });
-  assert.deepEqual(out, { kind: "routed", target: "github-copilot/gpt-5.4-nano", cached: false, reason: "x" });
+  assert.deepEqual(out, { kind: "routed", target: "github-copilot/gpt-5.4-nano", cached: false, source: "classifier", taskType: "unknown", reason: "x" });
   clearCopilotCache();
+});
+
+// --- #352: deterministic capability-matrix override -------------------------
+// haiku is the cheap capable model; the classifier picks pricey opus — with
+// the matrix on, the pick is overridden; every fallback path keeps the
+// classifier's target with source "classifier".
+const MATRIX: RoutingMatrix = {
+  v: 1,
+  lastReviewed: "2026-07-06",
+  models: { "anthropic/haiku": { capable: ["code-edit"] } },
+};
+const cfEdit = () =>
+  completeReturning('{"taskType":"code-edit","model":"anthropic/opus","reason":"x"}');
+
+test("matrix override picks the cheapest capable model over the classifier's choice", async () => {
+  const pi = makePi(true);
+  const out = await route(pi, makeCtx(), "fix it", CFG_MATRIX, MATRIX, new DecisionCache(), new Set(), {
+    completeFn: cfEdit(),
+  });
+  assert.deepEqual(out, { kind: "routed", target: "anthropic/haiku", cached: false, source: "matrix", taskType: "code-edit", reason: "x" });
+});
+
+test("matrixEnabled false ignores the matrix entirely (explicit-off regression fence)", async () => {
+  const out = await route(makePi(true), makeCtx(), "fix it", CFG, MATRIX, new DecisionCache(), new Set(), {
+    completeFn: cfEdit(),
+  });
+  assert.deepEqual(out, { kind: "routed", target: "anthropic/opus", cached: false, source: "classifier", taskType: "code-edit", reason: "x" });
+});
+
+test("matrix null with the flag on behaves identically to flag off", async () => {
+  const out = await route(makePi(true), makeCtx(), "fix it", CFG_MATRIX, null, new DecisionCache(), new Set(), {
+    completeFn: cfEdit(),
+  });
+  assert.deepEqual(out, { kind: "routed", target: "anthropic/opus", cached: false, source: "classifier", taskType: "code-edit", reason: "x" });
+});
+
+test("empty capable set falls back to the classifier's pick (never throws)", async () => {
+  const out = await route(makePi(true), makeCtx(), "review it", CFG_MATRIX, MATRIX, new DecisionCache(), new Set(), {
+    completeFn: completeReturning('{"taskType":"code-review","model":"anthropic/opus","reason":"x"}'),
+  });
+  assert.deepEqual(out, { kind: "routed", target: "anthropic/opus", cached: false, source: "classifier", taskType: "code-review", reason: "x" });
+});
+
+test("a matrix pick that went unavailable mid-loop is rejected in favor of the classifier's pick", async () => {
+  const pi = makePi(true);
+  const unavailable = new Set<string>();
+  // haiku (the capable matrix pick, and first classifier candidate) 429s while
+  // classifying; opus answers. The matrix must not route to quota-dead haiku.
+  const cf: CompleteFn = (model) =>
+    modelId(model) === "haiku"
+      ? Promise.reject(new Error("429 quota exceeded"))
+      : Promise.resolve({ content: [{ type: "text", text: '{"taskType":"code-edit","model":"anthropic/opus","reason":"x"}' }] });
+  const out = await route(pi, makeCtx(), "fix it", CFG_MATRIX, MATRIX, new DecisionCache(), unavailable, { completeFn: cf });
+  assert.deepEqual(out, { kind: "routed", target: "anthropic/opus", cached: false, source: "classifier", taskType: "code-edit", reason: "x" });
+});
+
+test("a cache hit replays the matrix-sourced decision without re-picking", async () => {
+  const pi = makePi(true);
+  const ctx = makeCtx();
+  const cache = new DecisionCache();
+  await route(pi, ctx, "fix it", CFG_MATRIX, MATRIX, cache, new Set(), { completeFn: cfEdit() });
+  const out = await route(pi, ctx, "fix it", CFG_MATRIX, MATRIX, cache, new Set(), { completeFn: cfEdit() });
+  assert.deepEqual(out, { kind: "routed", target: "anthropic/haiku", cached: true, source: "matrix", taskType: "code-edit" });
 });

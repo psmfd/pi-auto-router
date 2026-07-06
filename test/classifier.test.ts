@@ -16,6 +16,7 @@ test("parseChoice extracts JSON from a bare object", () => {
   assert.deepEqual(parseChoice('{"model":"anthropic/opus","reason":"complex"}'), {
     model: "anthropic/opus",
     reason: "complex",
+    taskType: "unknown",
   });
 });
 
@@ -25,11 +26,22 @@ test("parseChoice tolerates surrounding prose / code fences", () => {
 });
 
 test("parseChoice defaults reason to empty string and rejects bad shapes", () => {
-  assert.deepEqual(parseChoice('{"model":"x/y"}'), { model: "x/y", reason: "" });
+  assert.deepEqual(parseChoice('{"model":"x/y"}'), { model: "x/y", reason: "", taskType: "unknown" });
   assert.equal(parseChoice("no json here"), null);
   assert.equal(parseChoice("{ not json"), null);
   assert.equal(parseChoice('{"reason":"missing model"}'), null);
   assert.equal(parseChoice('{"model":""}'), null);
+});
+
+test("parseChoice validates taskType against the closed taxonomy (#351)", () => {
+  assert.equal(parseChoice('{"taskType":"code-edit","model":"a/b"}')?.taskType, "code-edit");
+  assert.equal(parseChoice('{"taskType":"simple-qa","model":"a/b"}')?.taskType, "simple-qa");
+});
+
+test("parseChoice degrades an invented/missing taskType to unknown, never a parse failure", () => {
+  assert.equal(parseChoice('{"taskType":"world-domination","model":"a/b"}')?.taskType, "unknown");
+  assert.equal(parseChoice('{"taskType":42,"model":"a/b"}')?.taskType, "unknown");
+  assert.equal(parseChoice('{"model":"a/b"}')?.taskType, "unknown");
 });
 
 test("parseChoice caps the model-supplied reason (shown verbatim in the UI)", () => {
@@ -52,7 +64,10 @@ test("classify reports ok with the parsed choice on success", async () => {
   const result = await classify(MODEL, OK_AUTH, PROMPT, {
     completeFn: completeReturning('{"model":"anthropic/opus","reason":"big task"}'),
   });
-  assert.deepEqual(result, { status: "ok", choice: { model: "anthropic/opus", reason: "big task" } });
+  assert.deepEqual(result, {
+    status: "ok",
+    choice: { model: "anthropic/opus", reason: "big task", taskType: "unknown" },
+  });
 });
 
 test("classify reports bad-response on abort or unparseable reply", async () => {

@@ -15,11 +15,17 @@
 import { complete, type UserMessage } from "@earendil-works/pi-ai";
 
 import type { RoutingPrompt } from "./policy.ts";
-import type { Auth, RouterModel } from "./types.ts";
+import { toTaskType, type Auth, type RouterModel, type TaskType } from "./types.ts";
 
 export interface ClassifierChoice {
   readonly model: string;
   readonly reason: string;
+  /**
+   * Measurement-only task-type label (#351): validated against the closed
+   * taxonomy, degraded to "unknown" on anything absent/invented. Never affects
+   * which model is routed to in this phase.
+   */
+  readonly taskType: TaskType;
 }
 
 /**
@@ -47,7 +53,7 @@ export type CompleteFn = (
   options: { apiKey: string; headers?: Record<string, string> | undefined; signal?: AbortSignal | undefined },
 ) => Promise<{ stopReason?: string; content: ReadonlyArray<{ type: string; text?: string }> }>;
 
-/** Extract `{model, reason}` from a model reply, tolerating surrounding prose/fences. */
+/** Extract `{taskType, model, reason}` from a model reply, tolerating surrounding prose/fences. */
 export function parseChoice(text: string): ClassifierChoice | null {
   const match = text.match(/\{[\s\S]*\}/);
   if (!match) return null;
@@ -64,7 +70,9 @@ export function parseChoice(text: string): ClassifierChoice | null {
   // prompt-injected classifier could otherwise emit an arbitrarily long string
   // (the "<=12 words" system instruction is advisory only).
   const reason = typeof rec.reason === "string" ? rec.reason.slice(0, 200) : "";
-  return { model: rec.model, reason };
+  // taskType is measurement-only: an invalid/missing label degrades to
+  // "unknown" and NEVER fails the parse — routing must not depend on it.
+  return { model: rec.model, reason, taskType: toTaskType(rec.taskType) };
 }
 
 export interface ClassifyDeps {
