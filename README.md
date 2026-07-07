@@ -74,7 +74,7 @@ observed data seeded the Phase 2 routing matrix, and the `source` split is what
 keeps it honestly re-evaluable now that #352 consults it (a dataset that can't
 separate matrix-forced from organic choices would be self-confirming).
 
-### Local workhorse in the rotation (#363)
+### Local workhorse in the rotation (#363, ADR-0084)
 
 A registered **cost-0 local model** (`omlx/coding-workhorse`, #518) sorts first
 in `orderClassifierModels()`, so the local model runs the classifier by default
@@ -83,10 +83,35 @@ when available. This is deliberate — the decision is recorded in
 the call is free and burns no frontier quota, each *novel* prompt costs one of
 oMLX's 8 sustained concurrency slots (local-llm ADR-010) and the decision cache
 absorbs repeats, and a nominal fake cost would corrupt the #351/#520
-observed-cost data. Ties among cost-0 models break smallest-window-first (a
-128k Copilot entry edges the 131k workhorse). Operators who want determinism
-pin `classifierModel` (`"provider/id"`) in
-`~/.pi/agent/extensions/auto-router/state.json`.
+observed-cost data.
+
+As of [ADR-0084](https://github.com/psmfd/pi-config/blob/main/adrs/0084-auto-router-prefer-local-classifier.md)
+(#589), the local-first preference is enforced explicitly by a strict
+`provider === "omlx"` partition placed after the cost/window sort — a live
+local candidate leads the classifier rotation even when a cost-0 Copilot model
+has a smaller window. The previous accepted-tiebreak behavior (smallest window
+first among cost-0 candidates) is preserved behind an opt-out.
+
+Operators can override this per-user via `~/.pi/agent/settings.json`
+(user-layer only, same trust boundary as `subagent.copilotFallbackModel` per
+ADR-0080; project-layer `.pi/settings.json` is deliberately not consulted):
+
+```json
+{
+  "extensionSettings": {
+    "autoRouter": {
+      "preferLocalOmlx": false
+    }
+  }
+}
+```
+
+Default is `true`. Set `false` to restore pure cost/window ordering. Malformed
+or missing values default to `true`. The value is read once on `session_start`.
+
+An explicit `classifierModel` pin
+(`"provider/id"`) in `~/.pi/agent/extensions/auto-router/state.json` still
+wins over both this preference and the cost/window sort.
 
 The hand-authored **capability floor** for task-type routing lives in
 [`shared/routing-matrix.json`](https://github.com/psmfd/pi-config/blob/main/agent/extensions/shared/routing-matrix.json) — the workhorse's

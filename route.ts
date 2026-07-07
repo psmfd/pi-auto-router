@@ -69,6 +69,12 @@ export interface RouteDeps {
   readonly completeFn?: CompleteFn;
   /** Injectable fetch for Copilot live-model discovery (real `fetch` in prod). */
   readonly fetchFn?: FetchLike;
+  /**
+   * Prefer local `omlx/*` candidates in classifier trial order (ADR-0084).
+   * Undefined → `true` (local-first by default). Read once per session from
+   * user-layer settings by `index.ts` and threaded through unchanged.
+   */
+  readonly preferOmlx?: boolean;
 }
 
 function splitTarget(target: string): { provider: string; id: string } {
@@ -144,7 +150,7 @@ export async function route(
     // provider error (e.g. 429), recording the dead model so we skip it next time.
     let choice: ClassifierChoice | undefined;
     const attempts: ClassifierAttempt[] = [];
-    for (const cand of orderClassifierModels(built.candidates, cfg.classifierModel)) {
+    for (const cand of orderClassifierModels(built.candidates, cfg.classifierModel, deps.preferOmlx ?? true)) {
       const id = `${cand.provider}/${cand.id}`;
       const classifierModel = ctx.modelRegistry.find(cand.provider, cand.id);
       if (!classifierModel) {

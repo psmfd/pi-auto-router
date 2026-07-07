@@ -13,6 +13,9 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 import { loadRoutingMatrix, type RoutingMatrix } from "./shared/routing-matrix.ts";
 import { clearAnthropicCache } from "./anthropic-discovery.ts";
@@ -110,6 +113,29 @@ function formatProviders(providers: readonly string[]): string {
   return providers.length > 0 ? providers.join(",") : "all";
 }
 
+/**
+ * Read the USER-layer `extensionSettings.autoRouter.preferLocalOmlx` override
+ * (ADR-0084). Project-layer settings are deliberately not consulted — same
+ * trust boundary as token-meter (ADR-0073) and the subagent Copilot fallback
+ * (ADR-0080): a hostile repo must not be able to redirect parent-session
+ * classifier traffic. Any read/parse error or non-boolean value falls back
+ * to the built-in default (`true` — local-first).
+ */
+async function readPreferLocalOmlxSetting(): Promise<boolean> {
+  try {
+    const p = path.join(os.homedir(), ".pi", "agent", "settings.json");
+    const j = JSON.parse(await fs.promises.readFile(p, "utf8")) as {
+      extensionSettings?: { autoRouter?: { preferLocalOmlx?: unknown } };
+    };
+    const v = j?.extensionSettings?.autoRouter?.preferLocalOmlx;
+    // Strict boolean only — reject truthy strings/numbers so accidental
+    // `"true"` or `1` cannot silently pass. Default to true on any mismatch.
+    return typeof v === "boolean" ? v : true;
+  } catch {
+    return true;
+  }
+}
+
 export default function autoRouter(pi: ExtensionAPI): void {
   let cfg: state.RouterState = state.DEFAULT_STATE;
   const cache = new state.DecisionCache();
@@ -128,6 +154,10 @@ export default function autoRouter(pi: ExtensionAPI): void {
   // unrouted usage is never misattributed.
   let pendingLabel: { readonly taskType: TaskType; readonly source: PickSource } | null = null;
   let turn = 0;
+  // ADR-0084: user-layer preference for local-first classifier ordering.
+  // Read once on session_start and passed to route() via RouteDeps.preferOmlx.
+  // Default true; overridden by ~/.pi/agent/settings.json only.
+  let preferLocalOmlx = true;
   // #519 precedence guard: an explicit argv --model wins over routing for the
   // whole process lifetime (argv never changes). Computed once; the notify is
   // one-time so an agentic session is not toasted every turn.
@@ -149,6 +179,7 @@ export default function autoRouter(pi: ExtensionAPI): void {
     clearOmlxCache(); // re-probe local oMLX availability each session (#364)
     pendingLabel = null;
     turn = 0;
+    preferLocalOmlx = await readPreferLocalOmlxSetting();
     if (ctx.model) showModel(ctx, ctx.model.provider, ctx.model.id);
   });
 
@@ -284,6 +315,7 @@ export default function autoRouter(pi: ExtensionAPI): void {
         matrix,
         cache,
         unavailable,
+        { preferOmlx: preferLocalOmlx },
       );
       pendingLabel =
         outcome.kind === "routed"

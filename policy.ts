@@ -177,15 +177,42 @@ export function resolveByTaskType(
  * (if still available), then cheapest-first (lowest input cost, then smallest
  * window as a tiebreak). The router tries them in this order, failing over to
  * the next when one is unavailable (e.g. a 429).
+ *
+ * When `preferOmlx` is true (ADR-0084, default), credentialed `omlx/*`
+ * candidates are placed ahead of the rest AFTER the cost/window sort and the
+ * configured-pin lookup, preserving within-group ordering. This affects the
+ * parent classifier trial order only; child argv `--model` pins are governed
+ * by the subagent extension's spawn-time gate (ADR-0076/0080), not this path.
+ *
+ * INVARIANT: `candidates` MUST already be provider-allowlist-filtered
+ * (ADR-0083). `buildRoutingPrompt` → `getCandidates` applies
+ * `providerAllowlist` before this function sees the list, so the omlx-first
+ * partition operates on the already-restricted set. A Copilot-restricted
+ * parent session therefore cannot re-admit `omlx/*` here. Do NOT reorder
+ * callers to invert that data flow.
+ *
+ * INVARIANT: liveness filtering happens upstream too. `resolveOmlxFilter`
+ * feeds `getCandidates` with the authoritative served-model set, so a dead
+ * or unloaded `omlx/*` is already absent from `candidates` — the partition
+ * cannot promote an unavailable local workhorse.
  */
 export function orderClassifierModels(
   candidates: readonly Candidate[],
   configured: string | null,
+  preferOmlx = true,
 ): Candidate[] {
   const byCost = [...candidates].sort(
     (a, b) => a.cost.input - b.cost.input || a.contextWindow - b.contextWindow,
   );
-  if (!configured) return byCost;
-  const pinned = byCost.find((c) => `${c.provider}/${c.id}` === configured);
-  return pinned ? [pinned, ...byCost.filter((c) => c !== pinned)] : byCost;
+  if (configured) {
+    const pinned = byCost.find((c) => `${c.provider}/${c.id}` === configured);
+    if (pinned) return [pinned, ...byCost.filter((c) => c !== pinned)];
+  }
+  if (!preferOmlx) return byCost;
+  // Strict provider equality (NOT substring/startsWith): a hypothetical
+  // future `provider: "omlx-cloud"` must NOT be swept into the local rung.
+  const omlxGroup = byCost.filter((c) => c.provider === "omlx");
+  if (omlxGroup.length === 0) return byCost;
+  const restGroup = byCost.filter((c) => c.provider !== "omlx");
+  return [...omlxGroup, ...restGroup];
 }

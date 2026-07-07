@@ -119,12 +119,13 @@ test("a cost-0 local workhorse sorts ahead of priced models as classifier (#363)
   ]);
 });
 
-test("cost-0 ties break smallest-window-first (a 128k copilot edges the 131k workhorse)", () => {
-  // Both cost 0 ⇒ the tiebreak is contextWindow ascending. This is accepted:
-  // whichever cost-0 model classifies, the call is free; the pin is the lever
-  // for operators who want determinism.
+test("cost-0 ties: omlx-first partition wins by default (ADR-0084 supersedes the #363 window-tiebreak accepted case)", () => {
+  // Both cost 0. Pre-ADR-0084: contextWindow ascending would have put
+  // gpt-5.5-mini (128k) ahead of coding-workhorse (131k). ADR-0084's local-first
+  // preference now flips this by default. The old behavior remains available
+  // via preferOmlx=false — covered in the ADR-0084 test block below.
   const cands = [cand("omlx", "coding-workhorse", 0, 131_072), cand("github-copilot", "gpt-5.5-mini", 0, 128_000)];
-  assert.deepEqual(orderClassifierModels(cands, null).map((c) => c.id), ["gpt-5.5-mini", "coding-workhorse"]);
+  assert.deepEqual(orderClassifierModels(cands, null).map((c) => c.id), ["coding-workhorse", "gpt-5.5-mini"]);
 });
 
 test("an explicit classifierModel pin overrides the cost-0 default (#363)", () => {
@@ -133,6 +134,63 @@ test("an explicit classifierModel pin overrides the cost-0 default (#363)", () =
     "haiku",
     "coding-workhorse",
   ]);
+});
+
+// --- ADR-0084: prefer local omlx in classifier trial order -----------------
+// Default `preferOmlx=true`. Read from user-layer settings by index.ts.
+// Below tests exercise the sort function's opt-out path and edge cases.
+
+test("orderClassifierModels: preferOmlx=false restores pure cost/window ordering (ADR-0084 opt-out)", () => {
+  const cands = [cand("omlx", "coding-workhorse", 0, 131_072), cand("github-copilot", "gpt-5.5-mini", 0, 128_000)];
+  assert.deepEqual(
+    orderClassifierModels(cands, null, false).map((c) => c.id),
+    ["gpt-5.5-mini", "coding-workhorse"],
+  );
+});
+
+test("orderClassifierModels: explicit classifierModel pin overrides preferOmlx=true", () => {
+  const cands = [cand("omlx", "coding-workhorse", 0, 131_072), cand("github-copilot", "gpt-5.5-mini", 0, 128_000)];
+  // Pinned Copilot wins even with local-first preference active.
+  assert.deepEqual(
+    orderClassifierModels(cands, "github-copilot/gpt-5.5-mini", true).map((c) => c.id),
+    ["gpt-5.5-mini", "coding-workhorse"],
+  );
+});
+
+test("orderClassifierModels: no omlx candidates → preferOmlx has no observable effect", () => {
+  const cands = [cand("anthropic", "haiku", 0.8), cand("anthropic", "opus", 5)];
+  assert.deepEqual(
+    orderClassifierModels(cands, null, true).map((c) => c.id),
+    orderClassifierModels(cands, null, false).map((c) => c.id),
+  );
+});
+
+test("orderClassifierModels: multiple omlx candidates sort by cost/window within-group, then before non-omlx", () => {
+  const cands = [
+    cand("omlx", "workhorse-big", 0, 131_072),
+    cand("omlx", "workhorse-small", 0, 64_000),
+    cand("anthropic", "haiku", 0.8),
+    cand("github-copilot", "gpt-5.5-mini", 0, 128_000),
+  ];
+  // Within omlx group: smaller window first (workhorse-small before workhorse-big).
+  // Within non-omlx group: gpt-5.5-mini (cost 0) before haiku (cost 0.8).
+  // Then omlx group leads overall.
+  assert.deepEqual(
+    orderClassifierModels(cands, null).map((c) => c.id),
+    ["workhorse-small", "workhorse-big", "gpt-5.5-mini", "haiku"],
+  );
+});
+
+test("orderClassifierModels: strict provider equality — 'omlx-cloud' is NOT swept into the local rung", () => {
+  // Guard against a startsWith/substring implementation regression: only
+  // `provider === "omlx"` participates in the local-first partition.
+  const cands = [
+    cand("omlx-cloud", "phantom", 0, 200_000),
+    cand("omlx", "coding-workhorse", 0, 131_072),
+  ];
+  const ids = orderClassifierModels(cands, null).map((c) => `${c.provider}/${c.id}`);
+  assert.equal(ids[0], "omlx/coding-workhorse");
+  assert.ok(ids.includes("omlx-cloud/phantom"));
 });
 
 test("buildRoutingPrompt excludes denied models from the menu", async () => {
