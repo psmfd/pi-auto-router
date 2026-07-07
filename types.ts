@@ -3,12 +3,15 @@
  *
  * `RouterModel` is the exact pi-ai model object that `complete()` and
  * `pi.setModel()` accept (derived from the published signature, so it tracks
- * the SDK without hand-maintenance). `Auth` mirrors the shape returned by
- * `ctx.modelRegistry.getApiKeyAndHeaders()` (verified against pi v0.79.0
- * example `examples/extensions/qna.ts`).
+ * the SDK without hand-maintenance). Imported from `@earendil-works/pi-ai/compat`
+ * because pi 0.80.x moved the request/response API off the root entrypoint
+ * (#573; runtime loader aliases root→compat as a strict superset, so this is
+ * a typecheck-only concern). `Auth` mirrors the shape returned by
+ * `ctx.modelRegistry.getApiKeyAndHeaders()` (verified against pi v0.80.2
+ * examples).
  */
 
-import type { complete } from "@earendil-works/pi-ai";
+import type { complete } from "@earendil-works/pi-ai/compat";
 
 /** The pi-ai model object accepted by `complete()` and `pi.setModel()`. */
 export type RouterModel = Parameters<typeof complete>[0];

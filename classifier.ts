@@ -1,18 +1,23 @@
 /**
  * auto-router/classifier.ts — the cheap-model side-call that picks a model.
  *
- * Uses pi-ai `complete()` (verified against pi v0.79.0 example
- * `examples/extensions/qna.ts` — NOT `streamSimple`, which is a provider
- * implementation hook in this version; see ADR-0031). Credentials are passed
- * explicitly (pi-ai v0.78.0 requires `options.apiKey`). `complete` is injected
- * so the parse/fallback logic unit-tests without a network call.
+ * Uses pi-ai `complete()` (verified against pi v0.80.2 examples
+ * `examples/extensions/qna.ts`, `summarize.ts`, `handoff.ts`,
+ * `custom-compaction.ts` — NOT `streamSimple`, which is a provider
+ * implementation hook; see ADR-0031). Imported from
+ * `@earendil-works/pi-ai/compat` because pi 0.80.x moved the request/response
+ * API off the root entrypoint per the pi 0.80.2 CHANGELOG (#573; runtime
+ * loader aliases root→compat as a strict superset, so the imports remain
+ * runtime-safe). Credentials are passed explicitly (pi-ai requires
+ * `options.apiKey`). `complete` is injected so the parse/fallback logic
+ * unit-tests without a network call.
  *
  * Failure is never fatal: any error, missing credential, abort, or unparseable
  * reply returns `null`, and the caller keeps the current model. Routing must
  * never block a turn.
  */
 
-import { complete, type UserMessage } from "@earendil-works/pi-ai";
+import { complete, type UserMessage } from "@earendil-works/pi-ai/compat";
 
 import type { RoutingPrompt } from "./policy.ts";
 import { toTaskType, type Auth, type RouterModel, type TaskType } from "./types.ts";

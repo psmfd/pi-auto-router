@@ -1,6 +1,6 @@
 {
   "name": "@psmfd/pi-auto-router",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Pi extension: per-prompt model selection via a cheap classifier (before_agent_start -> pi.setModel)",
   "type": "module",
   "license": "MIT",
