@@ -9,7 +9,7 @@ import { route, type RouteContext, type RoutePi } from "../route.ts";
 import { DecisionCache, type RouterState } from "../state.ts";
 import type { Auth, RouterModel } from "../types.ts";
 
-const CFG: RouterState = { enabled: true, classifierModel: null, allowlist: [], matrixEnabled: false };
+const CFG: RouterState = { enabled: true, classifierModel: null, allowlist: [], orchestratorAllowedProviders: [], matrixEnabled: false };
 const CFG_MATRIX: RouterState = { ...CFG, matrixEnabled: true };
 
 function mkModel(provider: string, id: string): RouterModel {
@@ -150,6 +150,71 @@ test("returns no-candidates when nothing is credentialed", async () => {
     completeFn: completeReturning("{}"),
   });
   assert.deepEqual(out, { kind: "no-candidates", reason: "none-credentialed" });
+});
+
+test("primary provider restriction refuses to fall through to local when no allowed provider is available", async () => {
+  const out = await route(
+    makePi(),
+    makeCtx({ available: [{ provider: "omlx", id: "coding-workhorse", contextWindow: 131_072, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] }),
+    "hi",
+    { ...CFG, orchestratorAllowedProviders: ["github-copilot"] },
+    null,
+    new DecisionCache(),
+    new Set(),
+    { completeFn: completeReturning("{}") },
+  );
+  assert.deepEqual(out, { kind: "provider-restriction-empty", providers: ["github-copilot"] });
+});
+
+test("primary provider restriction keeps matrix routing from forcing local workhorse", async () => {
+  const available = [
+    { provider: "omlx", id: "coding-workhorse", contextWindow: 131_072, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+    { provider: "github-copilot", id: "gpt-5-mini", contextWindow: 128_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+  ];
+  const localMatrix: RoutingMatrix = {
+    v: 1,
+    lastReviewed: "2026-07-06",
+    models: { "omlx/coding-workhorse": { capable: ["code-edit"] } },
+  };
+  const pi = makePi(true);
+  const out = await route(
+    pi,
+    makeCtx({ available }),
+    "fix it",
+    { ...CFG_MATRIX, orchestratorAllowedProviders: ["github-copilot"] },
+    localMatrix,
+    new DecisionCache(),
+    new Set(),
+    { completeFn: completeReturning('{"taskType":"code-edit","model":"github-copilot/gpt-5-mini","reason":"x"}') },
+  );
+  assert.deepEqual(out, {
+    kind: "routed",
+    target: "github-copilot/gpt-5-mini",
+    cached: false,
+    source: "classifier",
+    taskType: "code-edit",
+    reason: "x",
+  });
+  assert.equal(`${pi.calls[0]?.provider}/${pi.calls[0]?.id}`, "github-copilot/gpt-5-mini");
+});
+
+test("primary provider restriction composes with the concrete model allowlist", async () => {
+  const available = [
+    { provider: "github-copilot", id: "gpt-5-mini", contextWindow: 128_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+    { provider: "github-copilot", id: "claude-sonnet-4.5", contextWindow: 200_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+    { provider: "anthropic", id: "opus", contextWindow: 200_000, cost: { input: 5, output: 25, cacheRead: 0, cacheWrite: 0 } },
+  ];
+  const out = await route(
+    makePi(true),
+    makeCtx({ available }),
+    "hi",
+    { ...CFG, allowlist: ["github-copilot/gpt-5-mini"], orchestratorAllowedProviders: ["github-copilot"] },
+    null,
+    new DecisionCache(),
+    new Set(),
+    { completeFn: completeReturning('{"model":"github-copilot/gpt-5-mini","reason":"x"}') },
+  );
+  assert.deepEqual(out, { kind: "routed", target: "github-copilot/gpt-5-mini", cached: false, source: "classifier", taskType: "unknown", reason: "x" });
 });
 
 test("falls back (no setModel) when every candidate returns no JSON", async () => {

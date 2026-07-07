@@ -64,6 +64,12 @@ function feedback(ctx: ExtensionContext, outcome: RouteOutcome): void {
       ctx.ui.notify(msg, "warning");
       break;
     }
+    case "provider-restriction-empty":
+      ctx.ui.notify(
+        `auto-router: primary provider restriction (${outcome.providers.join(", ")}) left no credentialed candidates; kept current`,
+        "warning",
+      );
+      break;
     case "classify-failed": {
       const atts = outcome.attempts;
       const allRateLimited = atts.length > 0 && atts.every((a) => a.detail === "rate-limited");
@@ -84,6 +90,24 @@ function feedback(ctx: ExtensionContext, outcome: RouteOutcome): void {
       ctx.ui.notify(`auto-router: ${outcome.target} not in registry; kept current`, "warning");
       break;
   }
+}
+
+function normalizeProviders(values: readonly string[]): string[] {
+  const providers = values
+    .map((p) => p.trim().toLowerCase())
+    .filter((p) => p.length > 0 && !/[\s/]/.test(p));
+  return [...new Set(providers)].sort();
+}
+
+function hasRejectedProviders(values: readonly string[]): boolean {
+  return values.some((p) => {
+    const trimmed = p.trim().toLowerCase();
+    return trimmed.length === 0 || /[\s/]/.test(trimmed);
+  });
+}
+
+function formatProviders(providers: readonly string[]): string {
+  return providers.length > 0 ? providers.join(",") : "all";
 }
 
 export default function autoRouter(pi: ExtensionAPI): void {
@@ -129,7 +153,7 @@ export default function autoRouter(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("auto", {
-    description: "Auto model routing: /auto [on|off|status|matrix on|matrix off]",
+    description: "Auto model routing: /auto [on|off|status|matrix on|matrix off|primary copilot|primary clear]",
     handler: async (args, ctx) => {
       const parts = (args ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean);
       if (parts[0] === "matrix") {
@@ -149,6 +173,68 @@ export default function autoRouter(pi: ExtensionAPI): void {
         );
         return;
       }
+      if (parts[0] === "primary" || parts[0] === "orchestrator") {
+        const sub = parts[1] ?? "status";
+        if (sub === "copilot") {
+          cfg = { ...cfg, orchestratorAllowedProviders: ["github-copilot"] };
+          await state.save(cfg);
+          cache.clear();
+        } else if (sub === "clear") {
+          cfg = { ...cfg, orchestratorAllowedProviders: [] };
+          await state.save(cfg);
+          cache.clear();
+        } else if (sub === "providers") {
+          const action = parts[2] ?? "status";
+          const providerArgs = parts.slice(3);
+          if ((action === "set" || action === "add" || action === "remove") && providerArgs.length === 0) {
+            ctx.ui.notify(
+              "auto-router: no providers supplied; use /auto primary clear to remove the restriction",
+              "warning",
+            );
+            return;
+          }
+          if ((action === "set" || action === "add" || action === "remove") && hasRejectedProviders(providerArgs)) {
+            ctx.ui.notify(
+              "auto-router: provider names only (for example github-copilot); use allowlist for provider/id entries",
+              "warning",
+            );
+            return;
+          }
+          if (action === "set") {
+            cfg = { ...cfg, orchestratorAllowedProviders: normalizeProviders(providerArgs) };
+            await state.save(cfg);
+            cache.clear();
+          } else if (action === "add") {
+            cfg = {
+              ...cfg,
+              orchestratorAllowedProviders: normalizeProviders([...cfg.orchestratorAllowedProviders, ...providerArgs]),
+            };
+            await state.save(cfg);
+            cache.clear();
+          } else if (action === "remove") {
+            const remove = new Set(normalizeProviders(providerArgs));
+            cfg = {
+              ...cfg,
+              orchestratorAllowedProviders: cfg.orchestratorAllowedProviders.filter((p) => !remove.has(p)),
+            };
+            await state.save(cfg);
+            cache.clear();
+          } else if (action === "clear") {
+            cfg = { ...cfg, orchestratorAllowedProviders: [] };
+            await state.save(cfg);
+            cache.clear();
+          } else if (action !== "status") {
+            ctx.ui.notify("auto-router: unknown primary providers action", "warning");
+            return;
+          }
+        }
+        ctx.ui.notify(
+          `auto-router: primary providers=${formatProviders(cfg.orchestratorAllowedProviders)}; ` +
+            "subagent frontmatter pins are unchanged",
+          "info",
+        );
+        return;
+      }
       const sub = parts[0] ?? "";
       if (sub === "on" || sub === "off") {
         cfg = { ...cfg, enabled: sub === "on" };
@@ -160,7 +246,8 @@ export default function autoRouter(pi: ExtensionAPI): void {
       ctx.ui.notify(
         `auto-router: ${active ? "ON" : "OFF"}${flagOn && !cfg.enabled ? " (via --auto)" : ""}${inert}; ` +
           `classifier=${cfg.classifierModel ?? "cheapest-available"}; ` +
-          `matrix=${cfg.matrixEnabled ? "on" : "off"}`,
+          `matrix=${cfg.matrixEnabled ? "on" : "off"}; ` +
+          `primaryProviders=${formatProviders(cfg.orchestratorAllowedProviders)}`,
         "info",
       );
     },

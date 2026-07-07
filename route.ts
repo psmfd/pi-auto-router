@@ -49,6 +49,7 @@ export interface ClassifierAttempt {
 
 export type RouteOutcome =
   | { readonly kind: "no-candidates"; readonly reason: "none-credentialed" | "all-unavailable" | "copilot-filtered" }
+  | { readonly kind: "provider-restriction-empty"; readonly providers: readonly string[] }
   | { readonly kind: "classify-failed"; readonly attempts: readonly ClassifierAttempt[] }
   | { readonly kind: "unresolved"; readonly choice: string }
   | { readonly kind: "no-registry-model"; readonly target: string }
@@ -121,14 +122,23 @@ export async function route(
       ...(ctx.signal ? { signal: ctx.signal } : {}),
     }).catch(() => null);
 
+    const providerAllowlist = cfg.orchestratorAllowedProviders.filter((p) => p.trim().length > 0);
+
     // The menu excludes models already known to be unavailable this session.
+    // `providerAllowlist` is a primary/orchestrator-only restriction: it trims
+    // the parent's routing menu but does not alter subagent child argv pins.
     const built = await buildRoutingPrompt(
       ctx,
       prompt,
-      { allowlist: cfg.allowlist, copilotFilter, anthropicFilter, omlxFilter },
+      { allowlist: cfg.allowlist, providerAllowlist, copilotFilter, anthropicFilter, omlxFilter },
       unavailable,
     );
-    if (!built.ok) return { kind: "no-candidates", reason: built.reason };
+    if (!built.ok) {
+      if (providerAllowlist.length > 0 && built.reason === "none-credentialed") {
+        return { kind: "provider-restriction-empty", providers: providerAllowlist };
+      }
+      return { kind: "no-candidates", reason: built.reason };
+    }
 
     // Try candidates cheapest-first as the classifier model; fail over on a
     // provider error (e.g. 429), recording the dead model so we skip it next time.

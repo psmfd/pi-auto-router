@@ -34,6 +34,8 @@ export interface Candidate {
 export interface CandidateOptions {
   /** If set and non-empty, only `provider/id` entries in this list pass. */
   readonly allowlist?: readonly string[] | undefined;
+  /** If set and non-empty, only candidates from these providers pass. */
+  readonly providerAllowlist?: readonly string[] | undefined;
   /** Context-window fallback when the registry omits it. Defaults to 128000. */
   readonly defaultContextWindow?: number | undefined;
   /**
@@ -79,6 +81,10 @@ export async function getCandidates(
   const available = await ctx.modelRegistry.getAvailable();
   const allow =
     options.allowlist && options.allowlist.length > 0 ? new Set(options.allowlist) : null;
+  const providerAllow =
+    options.providerAllowlist && options.providerAllowlist.length > 0
+      ? new Set(options.providerAllowlist)
+      : null;
   // Only an active (non-empty) copilot filter narrows the menu; null/empty is a
   // no-op, so a failed or zero-result discovery never empties the menu (#343).
   const copilotFilter =
@@ -94,7 +100,9 @@ export async function getCandidates(
 
   const out: Candidate[] = [];
   for (const m of available) {
-    // allowlist AND both live filters apply; none bypasses the others.
+    // provider allowlist, concrete allowlist, and live filters apply as AND;
+    // none bypasses the others.
+    if (providerAllow && !providerAllow.has(m.provider)) continue;
     if (allow && !allow.has(`${m.provider}/${m.id}`)) continue;
     if (copilotFilter && m.provider === "github-copilot" && !copilotFilter.has(m.id)) continue;
     if (anthropicFilter && m.provider === "anthropic" && !anthropicFilter.has(m.id)) continue;

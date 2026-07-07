@@ -22,6 +22,12 @@ export interface RouterState {
   /** Optional `provider/id` allowlist limiting routing targets. */
   readonly allowlist: readonly string[];
   /**
+   * Provider-level allowlist for primary/orchestrator routing. Empty means the
+   * router may consider every credentialed provider. Subagent children remain
+   * governed by their wrapper frontmatter pins and spawn-time gate.
+   */
+  readonly orchestratorAllowedProviders: readonly string[];
+  /**
    * Whether the deterministic capability-matrix pick overrides the
    * classifier's choice (#352, ADR-0078). Default ON since #353 (ADR-0079).
    * `load()` merges the persisted state over DEFAULT_STATE, so a state.json
@@ -35,6 +41,7 @@ export const DEFAULT_STATE: RouterState = {
   enabled: false,
   classifierModel: null,
   allowlist: [],
+  orchestratorAllowedProviders: [],
   matrixEnabled: true,
 };
 

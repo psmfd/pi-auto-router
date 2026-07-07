@@ -53,7 +53,13 @@ test("load returns DEFAULT_STATE when nothing is persisted", async () => {
 
 test("save then load round-trips router state", async () => {
   const dir = await fs.mkdtemp(join(tmpdir(), "auto-router-state-"));
-  const value = { enabled: true, classifierModel: "anthropic/haiku", allowlist: ["anthropic/opus"], matrixEnabled: true };
+  const value = {
+    enabled: true,
+    classifierModel: "anthropic/haiku",
+    allowlist: ["anthropic/opus"],
+    orchestratorAllowedProviders: ["github-copilot"],
+    matrixEnabled: true,
+  };
   await save(value, dir);
   assert.deepEqual(await load(dir), value);
 });
@@ -62,15 +68,17 @@ test("matrix routing is on by default (#353, ADR-0079)", () => {
   assert.equal(DEFAULT_STATE.matrixEnabled, true);
 });
 
-test("a state.json lacking matrixEnabled gets the current default via merge (ADR-0079)", async () => {
+test("a state.json lacking newer fields gets the current defaults via merge (ADR-0079)", async () => {
   // load() spreads the persisted file over DEFAULT_STATE, so an absent key
   // means "defer to whatever the code currently ships as default" — without
-  // the merge, the #353 default flip would only ever reach fresh installs.
+  // the merge, the #353 default flip and later primary-provider default would
+  // only ever reach fresh installs.
   const dir = await fs.mkdtemp(join(tmpdir(), "auto-router-state-"));
   const old = { enabled: true, classifierModel: null, allowlist: [] };
   await save(old as unknown as Parameters<typeof save>[0], dir);
   const loaded = await load(dir);
   assert.equal(loaded.matrixEnabled, true);
+  assert.deepEqual(loaded.orchestratorAllowedProviders, []);
   assert.equal(loaded.enabled, true); // keys the file carries win over defaults
 });
 

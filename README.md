@@ -17,7 +17,7 @@ Try it first without installing: `pi -e git:github.com/psmfd/pi-auto-router`.
 ## Flow
 
 1. `before_agent_start` fires once per prompt. If routing is off, no-op (manual `/model` is untouched). If the process was launched with an explicit `--model`, routing is **inert for the whole session** (see [Explicit `--model` precedence](#explicit---model-precedence-519-adr-0076)).
-2. `policy.ts` builds the **credentialed** candidate menu (`shared/candidates.ts` → `modelRegistry.getAvailable()`), each with a one-line cost/window hint, plus the current context-usage signal (`shared/signals.ts`) so high context pressure biases toward larger-window models. For `github-copilot`, `anthropic`, and `omlx`, the menu is first narrowed to live-available models (see [Copilot](#copilot-live-availability-adr-0035-343), [Anthropic](#anthropic-live-availability-538), and [oMLX](#omlx-live-availability-364) live availability).
+2. `policy.ts` builds the **credentialed** candidate menu (`shared/candidates.ts` → `modelRegistry.getAvailable()`), each with a one-line cost/window hint, plus the current context-usage signal (`shared/signals.ts`) so high context pressure biases toward larger-window models. If a primary/orchestrator provider restriction is configured, the parent session's menu is first narrowed to those providers (for example, `github-copilot`) while subagent frontmatter pins remain unchanged. For `github-copilot`, `anthropic`, and `omlx`, the menu is also narrowed to live-available models (see [Copilot](#copilot-live-availability-adr-0035-343), [Anthropic](#anthropic-live-availability-538), and [oMLX](#omlx-live-availability-364) live availability).
 3. `classifier.ts` calls a cheap model via pi-ai **`complete()`** (credentials resolved through `ctx.modelRegistry.getApiKeyAndHeaders()`), instructing it to return only `{"taskType":"<type>","model":"provider/id","reason":"…"}`. The task-type label is **measurement-only** (see [Task-type measurement](#task-type-measurement-351)); an invented or missing label degrades to `unknown` and never fails the parse.
 4. When **matrix routing** is enabled (the default since #353/ADR-0079; `/auto matrix off` opts out), the classifier's task-type label consults the hand-authored capability floor and the cheapest capable available model deterministically overrides the classifier's model choice (see [Matrix routing](#matrix-routing-352-adr-0078)); a matrix miss leaves the classifier's pick standing.
 5. The choice is resolved against the credentialed menu and applied via `pi.setModel(model)`.
@@ -135,6 +135,35 @@ dependency, so cross-mode cache replays would otherwise be stale).
 `validate.sh` guards the committed matrix (structure FAILs; `lastReviewed`
 staleness >180d and unpinned-key cross-reference WARN).
 
+### Primary/orchestrator provider restriction (#552, ADR-0083)
+
+Operators who want the parent/orchestrator session to stay on a provider tier
+(for example Copilot) can restrict auto-router's **primary** candidate menu
+without changing subagent behavior:
+
+```text
+/auto primary copilot
+/auto primary providers set github-copilot anthropic
+/auto primary clear
+/auto primary status
+```
+
+`/auto primary copilot` is shorthand for `primary providers set
+github-copilot`. When the restriction is non-empty, the classifier and matrix
+routing only see candidates from those providers for the parent session. A
+local-only matrix row such as `omlx/coding-workhorse` therefore cannot override
+a primary Copilot restriction; if no allowed provider is credentialed, the
+router keeps the current model and reports that the restriction left no
+candidates instead of falling through to local.
+
+This split is intentionally scoped to auto-router's parent-session
+`pi.setModel()` path. Subagent children are still governed by
+`agent/agents/*.md` frontmatter pins and the subagent spawn-time gate:
+read-only specialists can run on `omlx/coding-workhorse`, the review trio can
+run on `github-copilot/claude-opus-4.7`, and dropped local pins still take the
+Copilot fallback rung before the session default. Unpinned child agents inherit
+the active/default model as before.
+
 ### Explicit `--model` precedence (#519, ADR-0076)
 
 An explicit `--model` on the command line **wins unconditionally**: routing is
@@ -157,20 +186,26 @@ ADR-0076.
 | Control | Effect |
 |---|---|
 | `/auto on` / `/auto off` | Toggle routing; persisted across sessions (`shared/state.ts`, namespace `auto-router`). |
-| `/auto status` (or `/auto`) | Show ON/OFF + the configured classifier model + matrix on/off; appends `(inert: explicit --model)` when the precedence guard is active. |
+| `/auto status` (or `/auto`) | Show ON/OFF + the configured classifier model + matrix on/off + primary provider restriction; appends `(inert: explicit --model)` when the precedence guard is active. |
 | `/auto matrix on` / `/auto matrix off` | Toggle the deterministic capability-matrix override (#352); persisted; clears the decision cache. `/auto matrix` alone reports the state (and whether the matrix file loaded). |
+| `/auto primary copilot` | Restrict parent/orchestrator routing candidates to `github-copilot/*`; subagent pins are unchanged. |
+| `/auto primary providers set <provider> [...]` | Restrict parent/orchestrator routing to the listed providers. |
+| `/auto primary providers add <provider> [...]` / `/auto primary providers remove <provider> [...]` | Edit the parent/orchestrator provider restriction. |
+| `/auto primary clear` | Clear the parent/orchestrator provider restriction and restore the unrestricted candidate menu. |
 | `--auto` | Enable routing for the current session (in addition to the persisted toggle). |
 
 ## State
 
 `~/.pi/agent/extensions/auto-router/state.json`, schema-versioned (`{v:1}`):
-`{ enabled, classifierModel, allowlist, matrixEnabled }`. `classifierModel`
-null ⇒ the cheapest credentialed candidate runs the classifier. `allowlist`
-(empty ⇒ all) limits routing targets to specific `provider/id` entries.
-`matrixEnabled` (default true since #353/ADR-0079) gates matrix routing.
-`load()` merges the persisted file over the defaults, so a state file lacking
-the field gets the current default, while an explicitly persisted `false`
-(a real `/auto matrix off`) always survives.
+`{ enabled, classifierModel, allowlist, orchestratorAllowedProviders,
+matrixEnabled }`. `classifierModel` null ⇒ the cheapest credentialed candidate
+runs the classifier. `allowlist` (empty ⇒ all) limits routing targets to
+specific `provider/id` entries. `orchestratorAllowedProviders` (empty ⇒ all)
+limits only the parent/orchestrator provider menu; it does not modify subagent
+child pins. `matrixEnabled` (default true since #353/ADR-0079) gates matrix
+routing. `load()` merges the persisted file over the defaults, so a state file
+lacking a newer field gets the current default, while an explicitly persisted
+`false` (a real `/auto matrix off`) always survives.
 
 ## Files
 

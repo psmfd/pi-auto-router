@@ -43,6 +43,17 @@ test("buildRoutingPrompt includes usage line, menu, and the prompt", async () =>
   assert.equal(built.candidates.length, 1);
 });
 
+test("buildRoutingPrompt can restrict candidates by provider", async () => {
+  const built = await buildRoutingPrompt(
+    ctx([cand("omlx", "coding-workhorse", 0), cand("github-copilot", "gpt-5-mini", 0)]),
+    "fix it",
+    { providerAllowlist: ["github-copilot"] },
+  );
+  if (!built.ok) assert.fail("expected an ok build");
+  assert.deepEqual(built.candidates.map((c) => `${c.provider}/${c.id}`), ["github-copilot/gpt-5-mini"]);
+  assert.doesNotMatch(built.prompt.userText, /omlx\/coding-workhorse/);
+});
+
 test("buildRoutingPrompt delimits the user prompt and strips injected tags (LLM01)", async () => {
   const built = await buildRoutingPrompt(
     ctx([cand("anthropic", "haiku", 0.8)]),
