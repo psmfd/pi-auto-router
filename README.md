@@ -184,10 +184,34 @@ candidates instead of falling through to local.
 This split is intentionally scoped to auto-router's parent-session
 `pi.setModel()` path. Subagent children are still governed by
 `agent/agents/*.md` frontmatter pins and the subagent spawn-time gate:
-read-only specialists can run on `omlx/coding-workhorse`, the review trio can
-run on `github-copilot/claude-opus-4.7`, and dropped local pins still take the
-Copilot fallback rung before the session default. Unpinned child agents inherit
-the active/default model as before.
+read-only specialists **without a `bash` tool** run on `omlx/coding-workhorse`,
+the review trio runs on `github-copilot/claude-opus-4.7`, and dropped local
+pins still take the Copilot fallback rung before the session default. Every
+**`bash`-capable (mutation-capable) agent is unpinned by policy and sticks to
+the primary** — the interactive agents and `helm-expert` per ADR-0085, `linter`
+per ADR-0082 — inheriting the active/default model as before.
+
+### Set the primary and leave it (ADR-0085)
+
+To fix the parent/orchestrator on one model and keep it there — an Anthropic,
+Copilot, **or** local model — set it once and leave auto-router off (its
+default):
+
+```text
+/auto off                              # already the default
+/model anthropic/claude-opus-4-8       # or github-copilot/…, or a local id (Anthropic ids are dashed)
+```
+
+pi's native `setModel` persists that choice as the global default across
+sessions, and every unpinned / `bash`-capable child inherits it while the local
+and opus frontmatter pins resolve independently through the spawn-time gate.
+
+Two caveats: this "leave it" is pi's **global** default, so any later `/model`
+switch (even an incidental one) also persists (#533); and "unpinned → primary"
+holds only while auto-router is **off** — with routing on, an unpinned child
+carries no `--model` on argv and can be re-routed by the classifier/matrix (the
+argv-guard gap). A robust exact-model persisted primary that survives `/auto on`
+is tracked in #619.
 
 ### Explicit `--model` precedence (#519, ADR-0076)
 
