@@ -29,7 +29,7 @@
  *     resolution might serve fine
  *
  * Security posture (matches ADR-0035): host-pinned to loopback (a non-loopback
- * OMLX_BASE_URL refuses to probe), the bearer is read at request time from
+ * selected probe base refuses to probe), the bearer is read at request time from
  * OMLX_API_KEY or ~/.omlx/api-key and never stored or logged (only model-id
  * strings are cached), and the result only FILTERS a routing menu — nothing
  * enters model context (no-MCP compliant).
@@ -54,20 +54,36 @@ export interface OmlxDiscoveryDeps {
   readonly signal?: AbortSignal | undefined;
   /** Injectable key reader (real env+file lookup in production). */
   readonly readKey?: () => Promise<string | null>;
-  /** Injectable base override (defaults to OMLX_BASE_URL or localhost:8000). */
+  /** Explicit probe-base override (test hook / back-compat with OMLX_BASE_URL). */
   readonly baseUrl?: string | undefined;
+  /** Provider-configured oMLX base URL discovered from the model registry. */
+  readonly configuredBaseUrl?: string | undefined;
 }
 
-/** Resolve the probe base URL; null when it is not loopback (never probed). */
-export function omlxBaseUrl(override?: string): string | null {
-  const base = (override ?? process.env["OMLX_BASE_URL"] ?? DEFAULT_BASE).replace(/\/+$/, "");
+function validateLoopbackBase(base: string): string | null {
+  const normalized = base.replace(/\/+$/, "");
   try {
-    const u = new URL(base);
+    const u = new URL(normalized);
     if (u.protocol !== "http:" && u.protocol !== "https:") return null;
-    return LOOPBACK_HOSTS.has(u.hostname) || LOOPBACK_HOSTS.has(`[${u.hostname}]`) ? base : null;
+    return LOOPBACK_HOSTS.has(u.hostname) || LOOPBACK_HOSTS.has(`[${u.hostname}]`) ? normalized : null;
   } catch {
     return null;
   }
+}
+
+/**
+ * Resolve the probe base URL; null when the selected base is not loopback
+ * (never probed). Precedence: explicit override → OMLX_BASE_URL → configured
+ * provider baseUrl → localhost default. A configured but non-loopback provider
+ * intentionally fails open instead of falling back to localhost, because a dead
+ * default localhost socket says nothing about the configured provider endpoint.
+ */
+export function omlxBaseUrl(override?: string, configured?: string): string | null {
+  if (override !== undefined) return validateLoopbackBase(override);
+  const env = process.env["OMLX_BASE_URL"];
+  if (env !== undefined) return validateLoopbackBase(env);
+  if (configured !== undefined) return validateLoopbackBase(configured);
+  return validateLoopbackBase(DEFAULT_BASE);
 }
 
 /** Read the bearer key at request time: OMLX_API_KEY, else ~/.omlx/api-key. */
@@ -113,7 +129,7 @@ function isAbortLike(err: unknown): boolean {
 export async function fetchServedOmlxModels(deps: OmlxDiscoveryDeps = {}): Promise<Set<string> | null> {
   const fetchFn = deps.fetchFn ?? (globalThis.fetch as unknown as FetchLike | undefined);
   if (!fetchFn) return null;
-  const base = omlxBaseUrl(deps.baseUrl);
+  const base = omlxBaseUrl(deps.baseUrl, deps.configuredBaseUrl);
   if (!base) return null;
 
   const key = await (deps.readKey ?? readOmlxKey)();
@@ -144,8 +160,10 @@ export async function fetchServedOmlxModels(deps: OmlxDiscoveryDeps = {}): Promi
 }
 
 // Module-level cache: model-id strings only (never the key), short TTL so a
-// stopped/restarted server is noticed within a minute.
-let cache: { models: Set<string>; expiresAt: number } | undefined;
+// stopped/restarted server is noticed within a minute. Keyed by probe base so
+// tests/sessions that change from localhost to a configured provider endpoint
+// never reuse a stale result from the wrong server.
+let cache: { base: string; models: Set<string>; expiresAt: number } | undefined;
 
 /** Clear the discovery cache (called on session_start; used in tests). */
 export function clearOmlxCache(): void {
@@ -155,17 +173,36 @@ export function clearOmlxCache(): void {
 /** Cached wrapper around {@link fetchServedOmlxModels} (60s TTL; null uncached). */
 export async function getServedOmlxModels(deps: OmlxDiscoveryDeps = {}): Promise<Set<string> | null> {
   const now = (deps.now ?? Date.now)();
-  if (cache && now < cache.expiresAt) return cache.models;
-  const models = await fetchServedOmlxModels(deps);
-  if (models !== null) cache = { models, expiresAt: now + CACHE_TTL_MS };
+  const base = omlxBaseUrl(deps.baseUrl, deps.configuredBaseUrl);
+  if (!base) return null;
+  if (cache && cache.base === base && now < cache.expiresAt) return cache.models;
+  const models = await fetchServedOmlxModels({ ...deps, baseUrl: base, configuredBaseUrl: undefined });
+  if (models !== null) cache = { base, models, expiresAt: now + CACHE_TTL_MS };
   return models;
+}
+
+interface OmlxRegistryModel {
+  readonly provider: string;
+  readonly id: string;
+  readonly baseUrl?: string | undefined;
 }
 
 /** The registry slice {@link resolveOmlxFilter} needs. */
 export interface OmlxFilterContext {
   readonly modelRegistry: {
-    getAvailable(): Promise<readonly { provider: string; id: string }[]> | readonly { provider: string; id: string }[];
+    getAvailable(): Promise<readonly OmlxRegistryModel[]> | readonly OmlxRegistryModel[];
+    find?(provider: string, id: string): OmlxRegistryModel | undefined;
   };
+}
+
+function configuredOmlxBaseUrl(ctx: OmlxFilterContext, available: readonly OmlxRegistryModel[]): string | undefined {
+  for (const model of available) {
+    if (model.provider !== "omlx") continue;
+    const resolved = ctx.modelRegistry.find?.(model.provider, model.id);
+    const base = resolved?.baseUrl ?? model.baseUrl;
+    if (typeof base === "string" && base.trim().length > 0) return base;
+  }
+  return undefined;
 }
 
 /**
@@ -180,7 +217,7 @@ export async function resolveOmlxFilter(
   try {
     const available = await ctx.modelRegistry.getAvailable();
     if (!available.some((m) => m.provider === "omlx")) return null;
-    return await getServedOmlxModels(deps);
+    return await getServedOmlxModels({ ...deps, configuredBaseUrl: configuredOmlxBaseUrl(ctx, available) });
   } catch {
     return null;
   }

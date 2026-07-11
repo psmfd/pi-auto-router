@@ -89,8 +89,11 @@ As of [ADR-0084](https://github.com/psmfd/pi-config/blob/main/adrs/0084-auto-rou
 (#589), the local-first preference is enforced explicitly by a strict
 `provider === "omlx"` partition placed after the cost/window sort — a live
 local candidate leads the classifier rotation even when a cost-0 Copilot model
-has a smaller window. The previous accepted-tiebreak behavior (smallest window
-first among cost-0 candidates) is preserved behind an opt-out.
+has a smaller window. "Live" is determined by `shared/omlx-discovery.ts`, whose
+probe target is selected from explicit override / `OMLX_BASE_URL` / configured
+provider `baseUrl` / localhost default and then loopback-validated. The previous
+accepted-tiebreak behavior (smallest window first among cost-0 candidates) is
+preserved behind an opt-out.
 
 Operators can override this per-user via `~/.pi/agent/settings.json`
 (user-layer only, same trust boundary as `subagent.copilotFallbackModel` per
