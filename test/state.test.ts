@@ -56,6 +56,7 @@ test("save then load round-trips router state", async () => {
   const value = {
     enabled: true,
     classifierModel: "anthropic/haiku",
+    orchestratorModelLock: "github-copilot/gpt-5-mini",
     allowlist: ["anthropic/opus"],
     orchestratorAllowedProviders: ["github-copilot"],
     matrixEnabled: true,
@@ -79,6 +80,7 @@ test("a state.json lacking newer fields gets the current defaults via merge (ADR
   const loaded = await load(dir);
   assert.equal(loaded.matrixEnabled, true);
   assert.deepEqual(loaded.orchestratorAllowedProviders, []);
+  assert.equal(loaded.orchestratorModelLock, null);
   assert.equal(loaded.enabled, true); // keys the file carries win over defaults
 });
 

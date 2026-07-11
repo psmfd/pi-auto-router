@@ -9,9 +9,12 @@
  */
 
 import { getCandidates, type Candidate, type CandidatesContext, type CandidateOptions } from "./shared/candidates.ts";
+import { resolveCapabilityPick } from "./shared/model-ranking.ts";
 import type { RoutingMatrix } from "./shared/routing-matrix.ts";
-import { getUsage, THRESHOLDS, type NormalizedUsage, type UsageContext } from "./shared/signals.ts";
+import { getUsage, type NormalizedUsage, type UsageContext } from "./shared/signals.ts";
 import type { TaskType } from "./types.ts";
+
+export { COST_RANK_K, costRank } from "./shared/model-ranking.ts";
 
 export interface PolicyContext extends CandidatesContext, UsageContext {}
 
@@ -116,16 +119,9 @@ export function resolveChoice(
  * that data, and #541 tracks recalibrating k from it. k does not affect the
  * zero-cost local candidate, which wins its capable set at any k.
  */
-export const COST_RANK_K = 1;
-
-/** The matrix cost-rank scalar (ADR-0078) — dollars per Mtok, both axes. */
-export function costRank(c: Candidate): number {
-  return c.cost.input + COST_RANK_K * c.cost.output;
-}
-
 /**
- * Deterministic matrix pick (#352, ADR-0078): the cheapest capable available
- * window-adequate candidate for `taskType`, or `null` when any filter stage
+ * Deterministic matrix pick (#352, ADR-0078): the local-first cheapest capable
+ * available window-adequate candidate for `taskType`, or `null` when any filter stage
  * empties (the caller falls back to the classifier's own pick — never throws,
  * never an arbitrary choice).
  *
@@ -138,8 +134,9 @@ export function costRank(c: Candidate): number {
  *     window at the current token count would force immediate compaction;
  *     excluded before cost-rank. `usage === null` means unknown — fail open,
  *     filter skipped (signals.ts: null is "unknown", never "empty").
- *  4. cost-rank by `costRank` ascending; ties break on smaller window, then
- *     `provider/id` string order, so the pick never depends on menu order.
+ *  4. rank local providers first (when present), then cost-rank by `costRank`
+ *     ascending; ties break on smaller window, then `provider/id` string order,
+ *     so the pick never depends on menu order.
  *
  * `candidates` must be the live-filtered menu (`built.candidates`) — never the
  * raw registry — so allowlist and copilot/anthropic/omlx filters compose.
@@ -152,24 +149,7 @@ export function resolveByTaskType(
   usage: NormalizedUsage | null,
 ): Candidate | null {
   if (matrix === null || taskType === "unknown") return null;
-  const eligible = candidates.filter((c) => {
-    const key = `${c.provider}/${c.id}`;
-    const entry = matrix.models[key];
-    if (!entry || !entry.capable.includes(taskType)) return false;
-    if (unavailable.has(key)) return false;
-    if (usage !== null && usage.tokens / c.contextWindow >= THRESHOLDS.FORCE_COMPACT_AT) {
-      return false;
-    }
-    return true;
-  });
-  if (eligible.length === 0) return null;
-  const ranked = [...eligible].sort(
-    (a, b) =>
-      costRank(a) - costRank(b) ||
-      a.contextWindow - b.contextWindow ||
-      `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`),
-  );
-  return ranked[0] ?? null;
+  return resolveCapabilityPick(candidates, taskType, matrix, unavailable, usage);
 }
 
 /**

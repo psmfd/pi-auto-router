@@ -232,9 +232,20 @@ const ALL_CAPABLE = M({
 });
 const NONE = new Set<string>();
 
-test("resolveByTaskType returns the cheapest capable candidate by input + k·output", () => {
+test("resolveByTaskType returns the local-first cheapest capable candidate", () => {
   const pick = resolveByTaskType(THREE, "code-edit", ALL_CAPABLE, NONE, null);
   assert.equal(pick && `${pick.provider}/${pick.id}`, "omlx/workhorse");
+});
+
+test("resolveByTaskType ranks local above same-cost non-local after capability filtering", () => {
+  const local = cand("omlx", "coding-workhorse", 0, 200_000);
+  const remote = cand("github-copilot", "free-mini", 0, 100_000);
+  const matrix = M({
+    "omlx/coding-workhorse": { capable: ["simple-qa"] },
+    "github-copilot/free-mini": { capable: ["simple-qa"] },
+  });
+  const pick = resolveByTaskType([remote, local], "simple-qa", matrix, NONE, null);
+  assert.equal(pick && `${pick.provider}/${pick.id}`, "omlx/coding-workhorse");
 });
 
 test("resolveByTaskType null paths: no matrix, unknown type, empty capable set, no overlap", () => {

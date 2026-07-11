@@ -9,7 +9,7 @@ import { route, type RouteContext, type RoutePi } from "../route.ts";
 import { DecisionCache, type RouterState } from "../state.ts";
 import type { Auth, RouterModel } from "../types.ts";
 
-const CFG: RouterState = { enabled: true, classifierModel: null, allowlist: [], orchestratorAllowedProviders: [], matrixEnabled: false };
+const CFG: RouterState = { enabled: true, classifierModel: null, orchestratorModelLock: null, allowlist: [], orchestratorAllowedProviders: [], matrixEnabled: false };
 const CFG_MATRIX: RouterState = { ...CFG, matrixEnabled: true };
 
 function mkModel(provider: string, id: string): RouterModel {

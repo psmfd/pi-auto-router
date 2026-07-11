@@ -131,7 +131,7 @@ after the recorded burn-in (97.8% cost reduction, zero quality regressions;
 see the #353 evidence comment). When enabled, the
 classifier's task-type label consults the capability floor and
 `resolveByTaskType` (`policy.ts`) deterministically overrides the classifier's
-model choice with the **cheapest capable available window-adequate** candidate:
+model choice with the **local-first cheapest capable available window-adequate** candidate:
 
 1. **Capability floor** — matrix membership only, never cost. Closed world for
    picks: a model absent from `routing-matrix.json` is never a *matrix* pick
@@ -146,8 +146,12 @@ model choice with the **cheapest capable available window-adequate** candidate:
    excluded before cost-ranking (routing to it would force immediate
    compaction). Unknown usage fails open — the filter is skipped, never
    guessed.
-4. **Cost-rank** — `input + k·output` with **k = 1** (per-Mtok prices; see
-   ADR-0078 Q3 — recalibration from observed token ratios is #541).
+4. **Local-first rank** — when local use is allowed, strict local provider
+   matches (`provider === "omlx"` today) form the first lane. Non-local models
+   cannot beat a capable local candidate merely by being cheaper or having a
+   smaller context window.
+5. **Cost-rank within lane** — `input + k·output` with **k = 1** (per-Mtok
+   prices; see ADR-0078 Q3 — recalibration from observed token ratios is #541).
    Deterministic tiebreak: smaller window, then `provider/id` order. This is
    deliberately NOT `orderClassifierModels`' input-only sort, which prices the
    classifier side-call, not the real turn.
@@ -161,7 +165,9 @@ malformed ⇒ matrix routing silently degrades to classifier routing. Toggling
 `/auto matrix on|off` clears the decision cache (a prompt hash carries no flag
 dependency, so cross-mode cache replays would otherwise be stale).
 `validate.sh` guards the committed matrix (structure FAILs; `lastReviewed`
-staleness >180d and unpinned-key cross-reference WARN).
+staleness >180d and unpinned-key cross-reference WARN). Matrix freshness is
+explicitly user-invoked and auditable: routing never silently refreshes or
+rewrites this policy file while classifying a prompt.
 
 ### Primary/orchestrator provider restriction (#552, ADR-0083)
 
@@ -194,27 +200,31 @@ pins still take the Copilot fallback rung before the session default. Every
 the primary** — the interactive agents and `helm-expert` per ADR-0085, `linter`
 per ADR-0082 — inheriting the active/default model as before.
 
-### Set the primary and leave it (ADR-0085)
+### Lock the orchestrator model while auto-router is active (ADR-0090)
 
-To fix the parent/orchestrator on one model and keep it there — an Anthropic,
-Copilot, **or** local model — set it once and leave auto-router off (its
-default):
+To keep the parent/orchestrator on one exact model while `/auto on` remains
+active, use the orchestrator model lock:
 
 ```text
-/auto off                              # already the default
-/model anthropic/claude-opus-4-8       # or github-copilot/…, or a local id (Anthropic ids are dashed)
+/auto lock current                     # lock to the model currently shown by pi
+/auto lock set github-copilot/gpt-5-mini
+/auto lock clear
+/auto lock status
 ```
 
-pi's native `setModel` persists that choice as the global default across
-sessions, and every unpinned / `bash`-capable child inherits it while the local
-and opus frontmatter pins resolve independently through the spawn-time gate.
+`/auto on` seeds the lock from the current model when no lock exists, so turning
+routing on no longer implies per-prompt parent-model drift. While the lock is
+set, `before_agent_start` re-applies the exact `provider/id` if needed and
+skips the classifier/matrix side-call for the parent turn. If the locked model
+is no longer registry-available or lacks credentials, the router reports the
+problem and keeps the current model rather than silently switching.
 
-Two caveats: this "leave it" is pi's **global** default, so any later `/model`
-switch (even an incidental one) also persists (#533); and "unpinned → primary"
-holds only while auto-router is **off** — with routing on, an unpinned child
-carries no `--model` on argv and can be re-routed by the classifier/matrix (the
-argv-guard gap). A robust exact-model persisted primary that survives `/auto on`
-is tracked in #619.
+Manual model changes while auto-router is active update the lock to the newly
+selected exact model (unless the process itself was launched with explicit
+`--model`, in which case the argv precedence guard makes routing inert). This
+lock is distinct from the provider-level `/auto primary providers ...`
+restriction below: provider restriction narrows a routing menu; model lock fixes
+the parent model.
 
 ### Explicit `--model` precedence (#519, ADR-0076)
 
@@ -238,8 +248,10 @@ ADR-0076.
 | Control | Effect |
 |---|---|
 | `/auto on` / `/auto off` | Toggle routing; persisted across sessions (`shared/state.ts`, namespace `auto-router`). |
-| `/auto status` (or `/auto`) | Show ON/OFF + the configured classifier model + matrix on/off + primary provider restriction; appends `(inert: explicit --model)` when the precedence guard is active. |
-| `/auto matrix on` / `/auto matrix off` | Toggle the deterministic capability-matrix override (#352); persisted; clears the decision cache. `/auto matrix` alone reports the state (and whether the matrix file loaded). |
+| `/auto status` (or `/auto`) | Show ON/OFF + the configured classifier model + matrix on/off + orchestrator model lock + primary provider restriction; appends `(inert: explicit --model)` when the precedence guard is active. |
+| `/auto matrix on` / `/auto matrix off` | Toggle the deterministic capability-matrix override (#352); persisted; clears the decision cache. `/auto matrix` or `/auto matrix status` reports loaded path, row count, last-reviewed metadata, and staleness. |
+| `/auto matrix review` | User-invoked freshness workflow hint: reports matrix metadata and points to `scripts/analyze-routing-matrix.sh`; never rewrites policy automatically. |
+| `/auto lock current` / `/auto lock set <provider/id>` / `/auto lock clear` | Set or clear the exact parent/orchestrator model lock used while auto-router is active. |
 | `/auto primary copilot` | Restrict parent/orchestrator routing candidates to `github-copilot/*`; subagent pins are unchanged. |
 | `/auto primary providers set <provider> [...]` | Restrict parent/orchestrator routing to the listed providers. |
 | `/auto primary providers add <provider> [...]` / `/auto primary providers remove <provider> [...]` | Edit the parent/orchestrator provider restriction. |
@@ -249,15 +261,17 @@ ADR-0076.
 ## State
 
 `~/.pi/agent/extensions/auto-router/state.json`, schema-versioned (`{v:1}`):
-`{ enabled, classifierModel, allowlist, orchestratorAllowedProviders,
-matrixEnabled }`. `classifierModel` null ⇒ the cheapest credentialed candidate
-runs the classifier. `allowlist` (empty ⇒ all) limits routing targets to
-specific `provider/id` entries. `orchestratorAllowedProviders` (empty ⇒ all)
-limits only the parent/orchestrator provider menu; it does not modify subagent
-child pins. `matrixEnabled` (default true since #353/ADR-0079) gates matrix
-routing. `load()` merges the persisted file over the defaults, so a state file
-lacking a newer field gets the current default, while an explicitly persisted
-`false` (a real `/auto matrix off`) always survives.
+`{ enabled, classifierModel, orchestratorModelLock, allowlist,
+orchestratorAllowedProviders, matrixEnabled }`. `classifierModel` null ⇒ the
+cheapest credentialed candidate runs the classifier. `orchestratorModelLock`
+null ⇒ no exact parent lock; otherwise the parent session is held to that exact
+`provider/id` while routing is active. `allowlist` (empty ⇒ all) limits routing
+targets to specific `provider/id` entries. `orchestratorAllowedProviders`
+(empty ⇒ all) limits only the parent/orchestrator provider menu; it does not
+modify subagent child pins. `matrixEnabled` (default true since #353/ADR-0079)
+gates matrix routing. `load()` merges the persisted file over the defaults, so
+a state file lacking a newer field gets the current default, while an explicitly
+persisted `false` (a real `/auto matrix off`) always survives.
 
 ## Files
 

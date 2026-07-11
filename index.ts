@@ -17,7 +17,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { loadRoutingMatrix, type RoutingMatrix } from "./shared/routing-matrix.ts";
+import { defaultMatrixPath, loadRoutingMatrix, type RoutingMatrix } from "./shared/routing-matrix.ts";
 import { clearAnthropicCache } from "./anthropic-discovery.ts";
 import { hasExplicitModelFlag } from "./argv-guard.ts";
 import { clearCopilotCache } from "./shared/copilot-discovery.ts";
@@ -113,6 +113,34 @@ function formatProviders(providers: readonly string[]): string {
   return providers.length > 0 ? providers.join(",") : "all";
 }
 
+function modelKey(model: { provider: string; id: string }): string {
+  return `${model.provider}/${model.id}`;
+}
+
+function validModelKey(value: string): boolean {
+  const slash = value.indexOf("/");
+  return slash > 0 && slash < value.length - 1 && !/\s/.test(value);
+}
+
+function splitModelKey(value: string): { provider: string; id: string } {
+  const slash = value.indexOf("/");
+  return { provider: value.slice(0, slash), id: value.slice(slash + 1) };
+}
+
+function matrixAgeDays(lastReviewed: string, now = new Date()): number | null {
+  const t = Date.parse(lastReviewed);
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, Math.floor((now.getTime() - t) / 86_400_000));
+}
+
+function formatMatrixStatus(matrix: RoutingMatrix | null): string {
+  if (!matrix) return "routing-matrix.json not loaded — classifier picks apply";
+  const rows = Object.keys(matrix.models).length;
+  const age = matrixAgeDays(matrix.lastReviewed);
+  const ageText = age === null ? "unknown age" : `${age}d old${age > 180 ? " (stale)" : ""}`;
+  return `path=${defaultMatrixPath()}; rows=${rows}; lastReviewed=${matrix.lastReviewed || "<missing>"}; ${ageText}`;
+}
+
 /**
  * Read the USER-layer `extensionSettings.autoRouter.preferLocalOmlx` override
  * (ADR-0084). Project-layer settings are deliberately not consulted — same
@@ -163,6 +191,10 @@ export default function autoRouter(pi: ExtensionAPI): void {
   // one-time so an agentic session is not toasted every turn.
   const explicitModel = hasExplicitModelFlag();
   let explicitModelNotified = false;
+  // ADR-0090 exact orchestrator model lock: suppress model_select feedback loops
+  // when this extension is re-applying the saved lock itself.
+  let applyingModelLock = false;
+  let applyingRouteModelChange = false;
 
   pi.registerFlag("auto", {
     description: "Enable per-prompt auto model routing for this session",
@@ -184,22 +216,71 @@ export default function autoRouter(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("auto", {
-    description: "Auto model routing: /auto [on|off|status|matrix on|matrix off|primary copilot|primary clear]",
+    description: "Auto model routing: /auto [on|off|status|matrix on|matrix off|lock current|lock set provider/id|lock clear|primary copilot|primary clear]",
     handler: async (args, ctx) => {
       const parts = (args ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean);
       if (parts[0] === "matrix") {
         // #352 (ADR-0078): toggle the deterministic capability-matrix override.
-        const sub = parts[1];
+        // ADR-0090/#660: status/review are user-invoked and never mutate the
+        // matrix file; routing itself never silently refreshes this policy.
+        const sub = parts[1] ?? "status";
         if (sub === "on" || sub === "off") {
           cfg = { ...cfg, matrixEnabled: sub === "on" };
           await state.save(cfg);
           // A prompt hash carries no dependency on the flag — decisions cached
           // under the other mode would replay stale picks. Drop them all.
           cache.clear();
+        } else if (sub === "review") {
+          ctx.ui.notify(
+            `auto-router: matrix review — ${formatMatrixStatus(matrix)}. ` +
+              "Run scripts/analyze-routing-matrix.sh and update routing-matrix.json in a reviewed PR; routing never auto-refreshes it.",
+            "info",
+          );
+          return;
+        } else if (sub !== "status") {
+          ctx.ui.notify("auto-router: unknown matrix action", "warning");
+          return;
         }
         ctx.ui.notify(
-          `auto-router: matrix ${cfg.matrixEnabled ? "ON" : "OFF"}` +
-            (matrix ? "" : " (routing-matrix.json not loaded — classifier picks apply)"),
+          `auto-router: matrix ${cfg.matrixEnabled ? "ON" : "OFF"}; ${formatMatrixStatus(matrix)}`,
+          "info",
+        );
+        return;
+      }
+      if (parts[0] === "lock") {
+        const sub = parts[1] ?? "status";
+        if (sub === "current") {
+          if (!ctx.model) {
+            ctx.ui.notify("auto-router: no current model is available to lock", "warning");
+            return;
+          }
+          cfg = { ...cfg, orchestratorModelLock: modelKey(ctx.model) };
+          await state.save(cfg);
+          cache.clear();
+        } else if (sub === "set") {
+          const target = parts[2] ?? "";
+          if (!validModelKey(target)) {
+            ctx.ui.notify("auto-router: use /auto lock set provider/id", "warning");
+            return;
+          }
+          const { provider, id } = splitModelKey(target);
+          if (!ctx.modelRegistry.find(provider, id)) {
+            ctx.ui.notify(`auto-router: ${target} is not in the available model registry`, "warning");
+            return;
+          }
+          cfg = { ...cfg, orchestratorModelLock: target };
+          await state.save(cfg);
+          cache.clear();
+        } else if (sub === "clear") {
+          cfg = { ...cfg, orchestratorModelLock: null };
+          await state.save(cfg);
+          cache.clear();
+        } else if (sub !== "status") {
+          ctx.ui.notify("auto-router: unknown lock action", "warning");
+          return;
+        }
+        ctx.ui.notify(
+          `auto-router: orchestratorModelLock=${cfg.orchestratorModelLock ?? "none"}`,
           "info",
         );
         return;
@@ -269,6 +350,9 @@ export default function autoRouter(pi: ExtensionAPI): void {
       const sub = parts[0] ?? "";
       if (sub === "on" || sub === "off") {
         cfg = { ...cfg, enabled: sub === "on" };
+        if (sub === "on" && cfg.orchestratorModelLock === null && ctx.model) {
+          cfg = { ...cfg, orchestratorModelLock: modelKey(ctx.model) };
+        }
         await state.save(cfg);
       }
       const flagOn = pi.getFlag("auto") === true;
@@ -278,6 +362,7 @@ export default function autoRouter(pi: ExtensionAPI): void {
         `auto-router: ${active ? "ON" : "OFF"}${flagOn && !cfg.enabled ? " (via --auto)" : ""}${inert}; ` +
           `classifier=${cfg.classifierModel ?? "cheapest-available"}; ` +
           `matrix=${cfg.matrixEnabled ? "on" : "off"}; ` +
+          `orchestratorLock=${cfg.orchestratorModelLock ?? "none"}; ` +
           `primaryProviders=${formatProviders(cfg.orchestratorAllowedProviders)}`,
         "info",
       );
@@ -306,7 +391,38 @@ export default function autoRouter(pi: ExtensionAPI): void {
       }
       return;
     }
+    if (cfg.orchestratorModelLock !== null) {
+      pendingLabel = null;
+      const { provider, id } = splitModelKey(cfg.orchestratorModelLock);
+      const locked = ctx.modelRegistry.find(provider, id);
+      if (!locked) {
+        if (ctx.hasUI) {
+          ctx.ui.notify(
+            `auto-router: locked orchestrator model ${cfg.orchestratorModelLock} is not available; kept current`,
+            "warning",
+          );
+        }
+        return;
+      }
+      if (!ctx.model || modelKey(ctx.model) !== cfg.orchestratorModelLock) {
+        applyingModelLock = true;
+        try {
+          const ok = await pi.setModel(locked);
+          if (!ok && ctx.hasUI) {
+            ctx.ui.notify(
+              `auto-router: no credential for locked orchestrator model ${cfg.orchestratorModelLock}; kept current`,
+              "warning",
+            );
+          }
+        } finally {
+          applyingModelLock = false;
+        }
+      }
+      if (ctx.model) showModel(ctx, ctx.model.provider, ctx.model.id);
+      return;
+    }
     try {
+      applyingRouteModelChange = true;
       const outcome = await route(
         pi as unknown as RoutePi,
         ctx as unknown as RouteContext,
@@ -317,12 +433,14 @@ export default function autoRouter(pi: ExtensionAPI): void {
         unavailable,
         { preferOmlx: preferLocalOmlx },
       );
+      applyingRouteModelChange = false;
       pendingLabel =
         outcome.kind === "routed"
           ? { taskType: outcome.taskType, source: outcome.source }
           : null;
       feedback(ctx, outcome);
     } catch {
+      applyingRouteModelChange = false;
       // Routing must never block a turn. The label is cleared too: a turn
       // whose route errored must not be recorded under the previous label.
       pendingLabel = null;
@@ -353,8 +471,17 @@ export default function autoRouter(pi: ExtensionAPI): void {
     return undefined;
   });
 
-  pi.on("model_select", (event, ctx) => {
+  pi.on("model_select", async (event, ctx) => {
     // Reflect the live model on every change (router `set`, manual `/model`, cycle, restore).
     showModel(ctx, event.model.provider, event.model.id);
+    const active = cfg.enabled || pi.getFlag("auto") === true;
+    if (active && !explicitModel && !applyingModelLock && !applyingRouteModelChange) {
+      const next = modelKey(event.model);
+      if (cfg.orchestratorModelLock !== next) {
+        cfg = { ...cfg, orchestratorModelLock: next };
+        await state.save(cfg).catch(() => undefined);
+        cache.clear();
+      }
+    }
   });
 }

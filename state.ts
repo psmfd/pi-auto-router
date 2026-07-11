@@ -19,6 +19,8 @@ export interface RouterState {
   readonly enabled: boolean;
   /** `provider/id` of the model used to run the classifier, or null for "cheapest available". */
   readonly classifierModel: string | null;
+  /** Exact parent/orchestrator model lock while auto-router is active; null disables the lock. */
+  readonly orchestratorModelLock: string | null;
   /** Optional `provider/id` allowlist limiting routing targets. */
   readonly allowlist: readonly string[];
   /**
@@ -40,6 +42,7 @@ export interface RouterState {
 export const DEFAULT_STATE: RouterState = {
   enabled: false,
   classifierModel: null,
+  orchestratorModelLock: null,
   allowlist: [],
   orchestratorAllowedProviders: [],
   matrixEnabled: true,
