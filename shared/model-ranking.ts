@@ -10,7 +10,7 @@
  */
 
 import type { Candidate } from "./candidates.ts";
-import type { RoutingMatrix } from "./routing-matrix.ts";
+import type { MatrixTier, RoutingMatrix } from "./routing-matrix.ts";
 import { THRESHOLDS, type NormalizedUsage } from "./signals.ts";
 
 /** The output weight in the matrix cost-rank scalar `input + k·output`. */
@@ -84,4 +84,51 @@ export function resolveCapabilityPick(
     return true;
   });
   return orderRankedCandidates(eligible, options)[0] ?? null;
+}
+
+/** Numeric rank of a tier, for "requested tier or better" comparisons. */
+const TIER_RANK: Readonly<Record<MatrixTier, number>> = { frontier: 3, capable: 2, fast: 1 };
+
+/**
+ * Deterministic quality-first tier pick (#656): among candidates whose matrix
+ * row declares a tier at or above the requested one AND covers `taskType`,
+ * pick the highest tier — cost deliberately drops out of the ordering (an
+ * agent that requested a tier said quality decides, not price). Ties break on
+ * larger context window, then `provider/id` lexical order, so the pick never
+ * depends on menu order. Untiered rows never satisfy a tier request. Returns
+ * null when the matrix is unavailable or no row qualifies — callers fall
+ * through their own ladder, same contract as resolveCapabilityPick.
+ *
+ * Provider-agnostic by construction: rows for any provider (OpenAI,
+ * Anthropic, Copilot, local) qualify identically; a row whose provider has no
+ * credentialed candidate simply never appears in `candidates` and is inert.
+ */
+export function resolveTierPick(
+  candidates: readonly Candidate[],
+  tier: MatrixTier,
+  taskType: string,
+  matrix: RoutingMatrix | null,
+  unavailable: ReadonlySet<string>,
+): Candidate | null {
+  if (matrix === null) return null;
+  const wanted = TIER_RANK[tier];
+  const eligible = candidates.filter((c) => {
+    const key = `${c.provider}/${c.id}`;
+    const entry = matrix.models[key];
+    if (!entry?.tier || TIER_RANK[entry.tier] < wanted) return false;
+    if (!entry.capable.includes(taskType)) return false;
+    return !unavailable.has(key);
+  });
+  return (
+    [...eligible].sort((a, b) => {
+      const tierDelta =
+        TIER_RANK[matrix.models[`${b.provider}/${b.id}`].tier as MatrixTier] -
+        TIER_RANK[matrix.models[`${a.provider}/${a.id}`].tier as MatrixTier];
+      return (
+        tierDelta ||
+        b.contextWindow - a.contextWindow ||
+        `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`)
+      );
+    })[0] ?? null
+  );
 }

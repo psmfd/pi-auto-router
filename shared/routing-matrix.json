@@ -1,11 +1,117 @@
 {
   "v": 1,
-  "description": "Hand-authored capability floor per task type (#350/#363): which models clear the bar for each task-type label emitted by the auto-router classifier. Consulted by auto-router's resolveByTaskType since #352 (ADR-0078) when matrix routing is enabled (the default since #353/ADR-0079; /auto matrix off opts out). Closed-world for matrix picks: a model absent here is never a matrix pick, though the classifier may still choose it — so absence never removes a model from routing. Ranking happens only WITHIN a capable set: local providers rank first when local use is allowed, then cost-ranking (input + k*output, k=1), then context window and provider/id tie-breaks. Task types are the closed taxonomy in auto-router/types.ts TASK_TYPES. Human-reviewed, never auto-written by routing; refresh/review is user-invoked and auditable (mirrors the #344 cost-table posture): update capable sets only with a rationale and a fresh lastReviewed.",
-  "lastReviewed": "2026-07-06",
+  "description": "Hand-authored capability floor per task type (#350/#363) plus quality tiers (#656): which models clear the bar for each task-type label emitted by the auto-router classifier, and which quality tier (frontier/capable/fast) each row occupies for capability-tier wrapper selection. Consulted by auto-router's resolveByTaskType since #352 (ADR-0078) when matrix routing is enabled, and by the subagent policy seam (ADR-0090/ADR-0094) for every unpinned wrapper. Closed-world for matrix picks: a model absent here is never a matrix pick, though the classifier may still choose it \u2014 so absence never removes a model from routing. Untiered selection ranks WITHIN a capable set: local providers first when local use is allowed (lever+tag, ADR-0094), then cost-ranking (input + k*output, k=1), then context window and provider/id tie-breaks. Tier-requested selection is quality-first: tier rank descending, window descending, lexical \u2014 cost drops out. Every row must name a real provider/id verified at authoring time \u2014 against pi --list-models for onboarded providers, or the provider's official model documentation for forward-declared ones; rows for uncredentialed/not-yet-onboarded providers are inert, never errors. Task types are the closed taxonomy in auto-router/types.ts TASK_TYPES. Human-reviewed, never auto-written by routing; refresh/review is user-invoked and auditable (#660): update rows only with a rationale and a fresh lastReviewed.",
+  "lastReviewed": "2026-07-12",
   "models": {
     "omlx/coding-workhorse": {
-      "capable": ["simple-qa", "code-edit", "code-review", "agentic-loop"],
-      "rationale": "GLM-4.7-Flash-6bit, the sole pinned oMLX resident (local-llm ADR-009/010): tool-call-strong, text-only, designed for read-only subagent fan-out (reads/edits, search, codegen, summarization, tool-calling) — hence agentic-loop and the code types. NOT long-context despite the 202K native window: sustained concurrency (mark of 8, ADR-010) is prefill-activation-bound and falls as context grows; the sustained mark was validated at ~16K-token prefixes, and the pi registration deliberately caps contextWindow at 131072 — long-context work goes to the frontier. NOT creative: quality-tier work is deliberately not served locally (ADR-009)."
+      "capable": [
+        "simple-qa",
+        "code-edit",
+        "code-review",
+        "agentic-loop"
+      ],
+      "tier": "fast",
+      "rationale": "GLM-4.7-Flash-6bit, the sole pinned oMLX resident (local-llm ADR-009/010): tool-call-strong, text-only, designed for read-only subagent fan-out (reads/edits, search, codegen, summarization, tool-calling) \u2014 hence agentic-loop and the code types. NOT long-context despite the 202K native window: sustained concurrency (mark of 8, ADR-010) is prefill-activation-bound and falls as context grows; the sustained mark was validated at ~16K-token prefixes, and the pi registration deliberately caps contextWindow at 131072 \u2014 long-context work goes to the frontier. NOT creative: quality-tier work is deliberately not served locally (ADR-009). Tier fast: zero-cost and quick, but the #535 evaluation (ADR-0082) showed discipline and multi-tool orchestration below frontier grade."
+    },
+    "anthropic/claude-fable-5": {
+      "capable": [
+        "simple-qa",
+        "code-edit",
+        "code-review",
+        "long-context",
+        "agentic-loop",
+        "creative"
+      ],
+      "tier": "frontier",
+      "rationale": "Anthropic's top generally-available model (Claude 5 family), 1M window / 128K out per the registry \u2014 the quality ceiling for tier-frontier wrappers when an Anthropic credential is present. Registry-verified id (#656 authoring pass, 2026-07-12)."
+    },
+    "anthropic/claude-opus-4-8": {
+      "capable": [
+        "simple-qa",
+        "code-edit",
+        "code-review",
+        "long-context",
+        "agentic-loop",
+        "creative"
+      ],
+      "tier": "frontier",
+      "rationale": "Opus 4.8, 1M window / 128K out \u2014 frontier-tier sibling to Fable 5 (deterministic tie-break settles ordering). Registry-verified id (2026-07-12)."
+    },
+    "github-copilot/claude-opus-4.7": {
+      "capable": [
+        "simple-qa",
+        "code-edit",
+        "code-review",
+        "agentic-loop",
+        "creative"
+      ],
+      "tier": "frontier",
+      "rationale": "Copilot's top Claude (subscription rung). The review trio (checkmarx/code-review/security-review) ran pinned to this id before #656 migrated them to capability-tier: frontier \u2014 this row preserves that outcome through the matrix. 200K window in the Copilot registration, so no long-context. Registry-verified id (2026-07-12)."
+    },
+    "github-copilot/claude-sonnet-4.6": {
+      "capable": [
+        "simple-qa",
+        "code-edit",
+        "code-review",
+        "long-context",
+        "agentic-loop"
+      ],
+      "tier": "capable",
+      "rationale": "The #535 matched-pair evaluation's frontier baseline (ADR-0082): held report-only discipline 100% and won multi-tool orchestration 93%. 1M-window Copilot registration covers long-context. The default non-local pick for bash-capable (local-forbidden) wrappers via cheapest-capable ranking. Registry-verified id (2026-07-12)."
+    },
+    "anthropic/claude-sonnet-4-5-20250929": {
+      "capable": [
+        "simple-qa",
+        "code-edit",
+        "code-review",
+        "agentic-loop"
+      ],
+      "tier": "capable",
+      "rationale": "Observed serving routed turns on this host (task-types.jsonl); the Anthropic-credential capable-tier rung when Copilot is absent. Registry-verified id (2026-07-12)."
+    },
+    "github-copilot/gpt-5-mini": {
+      "capable": [
+        "simple-qa"
+      ],
+      "tier": "fast",
+      "rationale": "Cheap fast rung for simple lookups; the most-routed non-local model in this host's task-types.jsonl. Deliberately NOT capable of agentic-loop/code types \u2014 a fast-tier mini model must not become the cheapest-capable pick for local-forbidden subagent work. Registry-verified id (2026-07-12)."
+    },
+    "anthropic/claude-haiku-4-5": {
+      "capable": [
+        "simple-qa"
+      ],
+      "tier": "fast",
+      "rationale": "Anthropic fast rung (alias id, resolves to the dated snapshot); observed on this host's task-types.jsonl. Same deliberate simple-qa-only scope as gpt-5-mini. Registry-verified id (2026-07-12)."
+    },
+    "openai-codex/gpt-5.6-sol": {
+      "capable": [
+        "simple-qa",
+        "code-edit",
+        "code-review",
+        "long-context",
+        "agentic-loop",
+        "creative"
+      ],
+      "tier": "frontier",
+      "rationale": "OpenAI's top GPT-5.6 tier (GA 2026-07-09; 372K window / 128K out in pi's openai-codex registration). Registry-verified on the mybox VM's OpenAI-logged-in pi (2026-07-12) \u2014 the provider key is openai-codex (the ChatGPT/Codex subscription rung, analogous to github-copilot), NOT a bare openai API-key provider. Inert on hosts without that login, by design."
+    },
+    "openai-codex/gpt-5.6-terra": {
+      "capable": [
+        "simple-qa",
+        "code-edit",
+        "code-review",
+        "long-context",
+        "agentic-loop"
+      ],
+      "tier": "capable",
+      "rationale": "GPT-5.6 mid tier (372K window / 128K out). Registry-verified via the mybox VM's openai-codex login (2026-07-12); inert on hosts without it."
+    },
+    "openai-codex/gpt-5.6-luna": {
+      "capable": [
+        "simple-qa"
+      ],
+      "tier": "fast",
+      "rationale": "GPT-5.6 fast/cheap tier. Same deliberate simple-qa-only scope as the other fast rungs. Registry-verified via the mybox VM's openai-codex login (2026-07-12); inert on hosts without it."
     }
   }
 }

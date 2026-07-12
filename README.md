@@ -112,6 +112,30 @@ ADR-0080; project-layer `.pi/settings.json` is deliberately not consulted):
 Default is `true`. Set `false` to restore pure cost/window ordering. Malformed
 or missing values default to `true`. The value is read once on `session_start`.
 
+### Local-LLM role lever (ADR-0094, #685)
+
+`extensionSettings.localLlm.role` (same user-layer-only file; parsed by
+`shared/local-role.ts`, consumed by auto-router AND the subagent extension)
+globally governs where local (`omlx/*`) models may be used:
+
+```json
+{ "extensionSettings": { "localLlm": { "role": "classifier-only" } } }
+```
+
+- `"full"` (default) — local participates everywhere current policy allows.
+- `"classifier-only"` — local may RUN the classifier side-call, but is
+  excluded from the routing menu, matrix picks, and every subagent child.
+- `"off"` — no local model anywhere, classifier included.
+
+Under a restricted role, `/auto lock` refuses to lock a local model and a
+manual `/model omlx/…` is honored for the live session but not captured into
+the persisted lock. Only the three exact strings are recognized; anything
+else falls back to `"full"`. Read once on `session_start` (auto-router) and
+per tool call (subagent) — children read the same user-layer file, so the
+lever applies inside spawned subagents automatically. Per-agent local
+permission is the wrapper's `local-llm: true` frontmatter tag (see the
+subagent README § patch #12).
+
 An explicit `classifierModel` pin
 (`"provider/id"`) in `~/.pi/agent/extensions/auto-router/state.json` still
 wins over both this preference and the cost/window sort.

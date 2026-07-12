@@ -5,6 +5,8 @@ import type { RegistryModel } from "../shared/candidates.ts";
 import type { RoutingMatrix } from "../shared/routing-matrix.ts";
 import type { CompleteFn } from "../classifier.ts";
 import { clearCopilotCache, type FetchLike } from "../shared/copilot-discovery.ts";
+import { clearOmlxCache } from "../shared/omlx-discovery.ts";
+import { clearAnthropicCache } from "../anthropic-discovery.ts";
 import { route, type RouteContext, type RoutePi } from "../route.ts";
 import { DecisionCache, type RouterState } from "../state.ts";
 import type { Auth, RouterModel } from "../types.ts";
@@ -394,4 +396,56 @@ test("a cache hit replays the matrix-sourced decision without re-picking", async
   await route(pi, ctx, "fix it", CFG_MATRIX, MATRIX, cache, new Set(), { completeFn: cfEdit() });
   const out = await route(pi, ctx, "fix it", CFG_MATRIX, MATRIX, cache, new Set(), { completeFn: cfEdit() });
   assert.deepEqual(out, { kind: "routed", target: "anthropic/haiku", cached: true, source: "matrix", taskType: "code-edit" });
+});
+
+test("a cached local target is not replayed under a restricted lever (ADR-0094 review fix)", async () => {
+  const available = [
+    { provider: "omlx", id: "coding-workhorse", contextWindow: 131_072, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+    { provider: "anthropic", id: "haiku", contextWindow: 200_000, cost: { input: 0.8, output: 4, cacheRead: 0, cacheWrite: 0 } },
+  ];
+  const cache = new DecisionCache();
+  // Hermetic: every live discovery probe (copilot/anthropic/omlx) must fail
+  // OPEN so the omlx candidate stays in the menu on any host. Two traps the
+  // first version of this test hit: (a) the discovery modules cache probe
+  // results process-wide, so earlier tests in this file prime them from the
+  // real environment (a live local server on the dev Mac, confirmed-down in
+  // CI) — clear all three; (b) omlx-discovery maps a PLAIN fetch rejection
+  // to the authoritative empty set (confirmed-down) — only an abort-like
+  // rejection is the documented inconclusive/fail-open path.
+  clearCopilotCache();
+  clearAnthropicCache();
+  clearOmlxCache();
+  const noNetwork: FetchLike = () =>
+    Promise.reject(Object.assign(new Error("no network in tests"), { name: "AbortError" }));
+  // Turn 1, lever "full": the classifier picks the local model; cached.
+  const first = await route(
+    makePi(true),
+    makeCtx({ available }),
+    "summarize this",
+    CFG,
+    null,
+    cache,
+    new Set(),
+    { completeFn: completeReturning('{"model":"omlx/coding-workhorse","reason":"cheap"}'), localRole: "full", fetchFn: noNetwork },
+  );
+  assert.deepEqual(first, {
+    kind: "routed", target: "omlx/coding-workhorse", cached: false, source: "classifier", taskType: "unknown", reason: "cheap",
+  });
+  // Same prompt under "classifier-only": the cached local target must be
+  // dropped and re-classified against the lever-filtered target pool —
+  // never replayed. The classifier's own trial order may still use local.
+  const second = await route(
+    makePi(true),
+    makeCtx({ available }),
+    "summarize this",
+    CFG,
+    null,
+    cache,
+    new Set(),
+    { completeFn: completeReturning('{"model":"anthropic/haiku","reason":"non-local"}'), localRole: "classifier-only", fetchFn: noNetwork },
+  );
+  assert.equal(second.kind, "routed");
+  if (second.kind !== "routed") return;
+  assert.equal(second.target, "anthropic/haiku");
+  assert.equal(second.cached, false);
 });

@@ -313,3 +313,59 @@ test("costRank weights output by k=1 (not input-only like orderClassifierModels)
   const pick = resolveByTaskType([cheapIn, dearIn], "simple-qa", m, NONE, null);
   assert.equal(pick && pick.id, "dear-in");
 });
+
+// --- ADR-0094 (#685): localRole two-pool split ---
+
+test("buildRoutingPrompt under classifier-only: local stays in the classifier pool, out of the target pool and menu", async () => {
+  const built = await buildRoutingPrompt(
+    ctx([cand("omlx", "coding-workhorse", 0), cand("anthropic", "haiku", 0.8)]),
+    "fix it",
+    {},
+    new Set<string>(),
+    "classifier-only",
+  );
+  if (!built.ok) assert.fail("expected an ok build");
+  assert.deepEqual(
+    built.candidates.map((c) => `${c.provider}/${c.id}`),
+    ["omlx/coding-workhorse", "anthropic/haiku"],
+  );
+  assert.deepEqual(
+    built.targetCandidates.map((c) => `${c.provider}/${c.id}`),
+    ["anthropic/haiku"],
+  );
+  assert.doesNotMatch(built.prompt.userText, /omlx\/coding-workhorse/);
+});
+
+test("buildRoutingPrompt under off: local is out of both pools", async () => {
+  const built = await buildRoutingPrompt(
+    ctx([cand("omlx", "coding-workhorse", 0), cand("anthropic", "haiku", 0.8)]),
+    "fix it",
+    {},
+    new Set<string>(),
+    "off",
+  );
+  if (!built.ok) assert.fail("expected an ok build");
+  assert.deepEqual(built.candidates.map((c) => `${c.provider}/${c.id}`), ["anthropic/haiku"]);
+  assert.deepEqual(built.targetCandidates.map((c) => `${c.provider}/${c.id}`), ["anthropic/haiku"]);
+});
+
+test("buildRoutingPrompt under full: both pools identical, local included", async () => {
+  const built = await buildRoutingPrompt(
+    ctx([cand("omlx", "coding-workhorse", 0), cand("anthropic", "haiku", 0.8)]),
+    "fix it",
+  );
+  if (!built.ok) assert.fail("expected an ok build");
+  assert.deepEqual(built.candidates, built.targetCandidates);
+  assert.match(built.prompt.userText, /omlx\/coding-workhorse/);
+});
+
+test("buildRoutingPrompt: only-local menu under a restricted lever is local-restricted", async () => {
+  const built = await buildRoutingPrompt(
+    ctx([cand("omlx", "coding-workhorse", 0)]),
+    "fix it",
+    {},
+    new Set<string>(),
+    "classifier-only",
+  );
+  assert.deepEqual(built, { ok: false, reason: "local-restricted" });
+});

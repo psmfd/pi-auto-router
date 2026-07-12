@@ -17,7 +17,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { defaultMatrixPath, loadRoutingMatrix, type RoutingMatrix } from "./shared/routing-matrix.ts";
+import { DEFAULT_LOCAL_ROLE, isLocalModelKey, readLocalRole, type LocalRole } from "./shared/local-role.ts";
+import { defaultMatrixPath, gardenMatrix, loadRoutingMatrix, type RoutingMatrix } from "./shared/routing-matrix.ts";
 import { clearAnthropicCache } from "./anthropic-discovery.ts";
 import { hasExplicitModelFlag } from "./argv-guard.ts";
 import { clearCopilotCache } from "./shared/copilot-discovery.ts";
@@ -61,6 +62,10 @@ function feedback(ctx: ExtensionContext, outcome: RouteOutcome): void {
         msg =
           "auto-router: all available Copilot models are gated by your subscription tier " +
           "(not picker-enabled). Routing paused — use /model to pick one, or check your Copilot plan.";
+      } else if (outcome.reason === "local-restricted") {
+        msg =
+          "auto-router: only local models are available and extensionSettings.localLlm.role " +
+          "restricts them to the classifier. Configure a provider, or set localLlm.role to full.";
       } else {
         msg = "auto-router: no credentialed models to route. Configure a provider, or use /model.";
       }
@@ -136,9 +141,53 @@ function matrixAgeDays(lastReviewed: string, now = new Date()): number | null {
 function formatMatrixStatus(matrix: RoutingMatrix | null): string {
   if (!matrix) return "routing-matrix.json not loaded — classifier picks apply";
   const rows = Object.keys(matrix.models).length;
-  const age = matrixAgeDays(matrix.lastReviewed);
+  // #660: freshness is judged by the most recent human touch — the refresh
+  // audit block when present, else lastReviewed. Refresh metadata is only
+  // ever written by the human editing the file (tooling prints a snippet to
+  // paste; nothing programmatic writes the matrix).
+  const freshness = matrix.refresh?.at ?? matrix.lastReviewed;
+  const age = matrixAgeDays(freshness);
   const ageText = age === null ? "unknown age" : `${age}d old${age > 180 ? " (stale)" : ""}`;
-  return `path=${defaultMatrixPath()}; rows=${rows}; lastReviewed=${matrix.lastReviewed || "<missing>"}; ${ageText}`;
+  const refreshText = matrix.refresh
+    ? `; refreshed=${matrix.refresh.at} via ${matrix.refresh.tool} (${matrix.refresh.source})`
+    : "; refresh metadata absent (see scripts/analyze-routing-matrix.sh --suggest-refresh-metadata)";
+  return `path=${defaultMatrixPath()}; rows=${rows}; lastReviewed=${matrix.lastReviewed || "<missing>"}; ${ageText}${refreshText}`;
+}
+
+/**
+ * Matrix gardening surface (#656 follow-through): compare the live registry
+ * against the matrix rows on the read-only status/review commands. Dangling
+ * rows (provider onboarded, exact id gone) are actionable and named;
+ * unlisted credentialed models are summarized as per-provider counts (the
+ * registry lists dozens of ids — enumerating them would be noise). Runtime
+ * only — CI cannot see this host's credentials, so validate.sh carries just
+ * the static schema checks. Fails soft to an empty string: gardening must
+ * never break a status command.
+ */
+async function formatMatrixGardening(
+  matrix: RoutingMatrix | null,
+  ctx: ExtensionContext,
+): Promise<string> {
+  if (!matrix) return "";
+  try {
+    const available = await Promise.resolve(
+      (ctx.modelRegistry as { getAvailable(): { provider: string; id: string }[] }).getAvailable(),
+    );
+    const keys = new Set(available.map((m) => `${m.provider}/${m.id}`));
+    const g = gardenMatrix(matrix, keys);
+    const parts: string[] = [];
+    if (g.danglingRows.length > 0) {
+      parts.push(`DANGLING rows (provider onboarded, id not in registry — fix or remove): ${g.danglingRows.join(", ")}`);
+    }
+    const unlisted = Object.entries(g.unlistedByProvider)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([p, n]) => `${p}:${n}`)
+      .join(" ");
+    if (unlisted) parts.push(`credentialed models without a matrix row: ${unlisted}`);
+    return parts.length > 0 ? `; gardening — ${parts.join("; ")}` : "";
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -186,11 +235,18 @@ export default function autoRouter(pi: ExtensionAPI): void {
   // Read once on session_start and passed to route() via RouteDeps.preferOmlx.
   // Default true; overridden by ~/.pi/agent/settings.json only.
   let preferLocalOmlx = true;
+  // ADR-0094 (#685): global local-LLM role lever. Read once on session_start
+  // from user-layer settings (shared/local-role.ts); threaded into route()
+  // and enforced on /auto lock + model_select capture below.
+  let localRole: LocalRole = DEFAULT_LOCAL_ROLE;
   // #519 precedence guard: an explicit argv --model wins over routing for the
   // whole process lifetime (argv never changes). Computed once; the notify is
   // one-time so an agentic session is not toasted every turn.
   const explicitModel = hasExplicitModelFlag();
   let explicitModelNotified = false;
+  // ADR-0094 review fix: one notice per session when a persisted local lock
+  // is bypassed at its point of use (see the before_agent_start handler).
+  let localLockNotified = false;
   // ADR-0090 exact orchestrator model lock: suppress model_select feedback loops
   // when this extension is re-applying the saved lock itself.
   let applyingModelLock = false;
@@ -206,12 +262,20 @@ export default function autoRouter(pi: ExtensionAPI): void {
     cfg = await state.load();
     matrix = await loadRoutingMatrix(); // per-session reload: edits apply next session (#352)
     unavailable.clear(); // give quota-recovered models a fresh chance each session
+    // ADR-0094 review fix: routing decisions cache the resolved TARGET, and a
+    // cache hit bypasses the two-pool lever filtering in buildRoutingPrompt —
+    // a decision cached under a permissive lever must not replay after the
+    // lever (read once per session, next line block) has been restricted.
+    // route() also re-checks hits defensively; this is the session boundary.
+    cache.clear();
     clearCopilotCache(); // re-discover live Copilot availability each session
     clearAnthropicCache(); // re-discover live Anthropic availability each session (#538)
     clearOmlxCache(); // re-probe local oMLX availability each session (#364)
     pendingLabel = null;
     turn = 0;
     preferLocalOmlx = await readPreferLocalOmlxSetting();
+    localRole = await readLocalRole();
+    localLockNotified = false;
     if (ctx.model) showModel(ctx, ctx.model.provider, ctx.model.id);
   });
 
@@ -232,8 +296,8 @@ export default function autoRouter(pi: ExtensionAPI): void {
           cache.clear();
         } else if (sub === "review") {
           ctx.ui.notify(
-            `auto-router: matrix review — ${formatMatrixStatus(matrix)}. ` +
-              "Run scripts/analyze-routing-matrix.sh and update routing-matrix.json in a reviewed PR; routing never auto-refreshes it.",
+            `auto-router: matrix review — ${formatMatrixStatus(matrix)}${await formatMatrixGardening(matrix, ctx)}. ` +
+              "Run scripts/analyze-routing-matrix.sh (--suggest-refresh-metadata for the audit block) and update routing-matrix.json in a reviewed PR; routing never auto-refreshes it.",
             "info",
           );
           return;
@@ -242,7 +306,7 @@ export default function autoRouter(pi: ExtensionAPI): void {
           return;
         }
         ctx.ui.notify(
-          `auto-router: matrix ${cfg.matrixEnabled ? "ON" : "OFF"}; ${formatMatrixStatus(matrix)}`,
+          `auto-router: matrix ${cfg.matrixEnabled ? "ON" : "OFF"}; ${formatMatrixStatus(matrix)}${await formatMatrixGardening(matrix, ctx)}`,
           "info",
         );
         return;
@@ -254,6 +318,16 @@ export default function autoRouter(pi: ExtensionAPI): void {
             ctx.ui.notify("auto-router: no current model is available to lock", "warning");
             return;
           }
+          // ADR-0094: a persisted lock re-applies every turn — locking a local
+          // model would keep local in effect indefinitely against the lever.
+          // Refuse visibly; two conflicting operator directives must surface.
+          if (localRole !== "full" && isLocalModelKey(modelKey(ctx.model))) {
+            ctx.ui.notify(
+              `auto-router: refusing to lock ${modelKey(ctx.model)} — localLlm.role=${localRole} restricts local models; change the setting first`,
+              "warning",
+            );
+            return;
+          }
           cfg = { ...cfg, orchestratorModelLock: modelKey(ctx.model) };
           await state.save(cfg);
           cache.clear();
@@ -261,6 +335,14 @@ export default function autoRouter(pi: ExtensionAPI): void {
           const target = parts[2] ?? "";
           if (!validModelKey(target)) {
             ctx.ui.notify("auto-router: use /auto lock set provider/id", "warning");
+            return;
+          }
+          // ADR-0094: see the lock-current refusal above.
+          if (localRole !== "full" && isLocalModelKey(target)) {
+            ctx.ui.notify(
+              `auto-router: refusing to lock ${target} — localLlm.role=${localRole} restricts local models; change the setting first`,
+              "warning",
+            );
             return;
           }
           const { provider, id } = splitModelKey(target);
@@ -351,7 +433,17 @@ export default function autoRouter(pi: ExtensionAPI): void {
       if (sub === "on" || sub === "off") {
         cfg = { ...cfg, enabled: sub === "on" };
         if (sub === "on" && cfg.orchestratorModelLock === null && ctx.model) {
-          cfg = { ...cfg, orchestratorModelLock: modelKey(ctx.model) };
+          // ADR-0094 review fix: /auto on is a lock-WRITE site like
+          // lock current/set and the model_select capture — a live local
+          // model must not be persisted while the lever restricts local.
+          if (localRole !== "full" && isLocalModelKey(modelKey(ctx.model))) {
+            ctx.ui.notify(
+              `auto-router: current model ${modelKey(ctx.model)} not captured as the lock (localLlm.role=${localRole})`,
+              "info",
+            );
+          } else {
+            cfg = { ...cfg, orchestratorModelLock: modelKey(ctx.model) };
+          }
         }
         await state.save(cfg);
       }
@@ -362,6 +454,7 @@ export default function autoRouter(pi: ExtensionAPI): void {
         `auto-router: ${active ? "ON" : "OFF"}${flagOn && !cfg.enabled ? " (via --auto)" : ""}${inert}; ` +
           `classifier=${cfg.classifierModel ?? "cheapest-available"}; ` +
           `matrix=${cfg.matrixEnabled ? "on" : "off"}; ` +
+          `localRole=${localRole}; ` +
           `orchestratorLock=${cfg.orchestratorModelLock ?? "none"}; ` +
           `primaryProviders=${formatProviders(cfg.orchestratorAllowedProviders)}`,
         "info",
@@ -391,7 +484,26 @@ export default function autoRouter(pi: ExtensionAPI): void {
       }
       return;
     }
-    if (cfg.orchestratorModelLock !== null) {
+    // ADR-0094 review fix: enforce the lever at the point of USE, not just at
+    // the write sites — a local lock already resident in state.json (persisted
+    // pre-lever, hand-edited, or via the pre-fix /auto on capture) must not
+    // keep routing the orchestrator to a local model under a restricted lever.
+    // The lock is deliberately NOT auto-cleared (surfaced, never silently
+    // mutated); the turn falls through to routing, whose two-pool split keeps
+    // local out of the targets.
+    const lockBypassedByLever =
+      cfg.orchestratorModelLock !== null &&
+      localRole !== "full" &&
+      isLocalModelKey(cfg.orchestratorModelLock);
+    if (lockBypassedByLever && !localLockNotified && ctx.hasUI) {
+      localLockNotified = true;
+      ctx.ui.notify(
+        `auto-router: locked orchestrator model ${cfg.orchestratorModelLock} not applied — localLlm.role=${localRole} restricts local models; ` +
+          "routing proceeds without the lock (use /auto lock clear to drop it, or change the setting)",
+        "warning",
+      );
+    }
+    if (cfg.orchestratorModelLock !== null && !lockBypassedByLever) {
       pendingLabel = null;
       const { provider, id } = splitModelKey(cfg.orchestratorModelLock);
       const locked = ctx.modelRegistry.find(provider, id);
@@ -431,7 +543,7 @@ export default function autoRouter(pi: ExtensionAPI): void {
         matrix,
         cache,
         unavailable,
-        { preferOmlx: preferLocalOmlx },
+        { preferOmlx: preferLocalOmlx, localRole },
       );
       applyingRouteModelChange = false;
       pendingLabel =
@@ -477,6 +589,19 @@ export default function autoRouter(pi: ExtensionAPI): void {
     const active = cfg.enabled || pi.getFlag("auto") === true;
     if (active && !explicitModel && !applyingModelLock && !applyingRouteModelChange) {
       const next = modelKey(event.model);
+      // ADR-0094: a manual `/model omlx/…` is honored for the live session
+      // (operator's in-the-moment call), but is NOT auto-captured into the
+      // persisted lock while the lever restricts local — capture would extend
+      // a momentary choice indefinitely, re-applied on every future turn.
+      if (localRole !== "full" && isLocalModelKey(next)) {
+        if (ctx.hasUI) {
+          ctx.ui.notify(
+            `auto-router: ${next} honored for this session but not captured as the lock (localLlm.role=${localRole})`,
+            "info",
+          );
+        }
+        return;
+      }
       if (cfg.orchestratorModelLock !== next) {
         cfg = { ...cfg, orchestratorModelLock: next };
         await state.save(cfg).catch(() => undefined);

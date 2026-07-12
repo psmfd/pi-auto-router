@@ -10,6 +10,7 @@
  * deterministic capability-matrix pick, both validated through the same gates.
  */
 
+import { isLocalModelKey, type LocalRole } from "./shared/local-role.ts";
 import type { NotifyContext } from "./shared/notify.ts";
 import type { RoutingMatrix } from "./shared/routing-matrix.ts";
 import { getUsage } from "./shared/signals.ts";
@@ -48,7 +49,10 @@ export interface ClassifierAttempt {
 }
 
 export type RouteOutcome =
-  | { readonly kind: "no-candidates"; readonly reason: "none-credentialed" | "all-unavailable" | "copilot-filtered" }
+  | {
+      readonly kind: "no-candidates";
+      readonly reason: "none-credentialed" | "all-unavailable" | "copilot-filtered" | "local-restricted";
+    }
   | { readonly kind: "provider-restriction-empty"; readonly providers: readonly string[] }
   | { readonly kind: "classify-failed"; readonly attempts: readonly ClassifierAttempt[] }
   | { readonly kind: "unresolved"; readonly choice: string }
@@ -75,6 +79,13 @@ export interface RouteDeps {
    * user-layer settings by `index.ts` and threaded through unchanged.
    */
   readonly preferOmlx?: boolean;
+  /**
+   * Global local-LLM role lever (ADR-0094, #685). Undefined → "full".
+   * Read once per session from user-layer settings by `index.ts`.
+   * "classifier-only" keeps local in the classifier trial order but out of
+   * the target pool; "off" excludes it from both.
+   */
+  readonly localRole?: LocalRole;
 }
 
 function splitTarget(target: string): { provider: string; id: string } {
@@ -101,6 +112,14 @@ export async function route(
   // buildRoutingPrompt excludes `unavailable`, and cache.set() overwrites the
   // stale entry with the fresh choice.
   if (decision !== undefined && unavailable.has(decision.target)) {
+    decision = undefined;
+  }
+  // ADR-0094 review fix: a cache hit bypasses buildRoutingPrompt's two-pool
+  // lever filtering, so a target cached under a permissive lever must be
+  // re-validated here — drop-and-reclassify a local target whenever the
+  // lever restricts local. index.ts also clears the cache on session_start;
+  // this guard makes route() self-contained (and unit-testable) regardless.
+  if (decision !== undefined && (deps.localRole ?? "full") !== "full" && isLocalModelKey(decision.target)) {
     decision = undefined;
   }
   let cached = decision !== undefined;
@@ -138,6 +157,7 @@ export async function route(
       prompt,
       { allowlist: cfg.allowlist, providerAllowlist, copilotFilter, anthropicFilter, omlxFilter },
       unavailable,
+      deps.localRole ?? "full",
     );
     if (!built.ok) {
       if (providerAllowlist.length > 0 && built.reason === "none-credentialed") {
@@ -175,7 +195,10 @@ export async function route(
     }
     if (!choice) return { kind: "classify-failed", attempts };
 
-    const cand = resolveChoice(built.candidates, choice.model);
+    // ADR-0094: the real turn resolves against the TARGET pool — under
+    // "classifier-only" a local model may have run the classify() call above,
+    // but can never be what the turn is routed to.
+    const cand = resolveChoice(built.targetCandidates, choice.model);
     // Reject a choice that is unknown or went unavailable during the loop, so we
     // never route the real turn to a quota-dead model.
     if (!cand || unavailable.has(`${cand.provider}/${cand.id}`)) {
@@ -194,14 +217,14 @@ export async function route(
     // available, window-adequate candidate": the classifier's target stands.
     if (cfg.matrixEnabled && matrix) {
       const pick = resolveByTaskType(
-        built.candidates,
+        built.targetCandidates,
         choice.taskType,
         matrix,
         unavailable,
         getUsage(ctx),
       );
       if (pick) {
-        const revalidated = resolveChoice(built.candidates, `${pick.provider}/${pick.id}`);
+        const revalidated = resolveChoice(built.targetCandidates, `${pick.provider}/${pick.id}`);
         if (revalidated && !unavailable.has(`${revalidated.provider}/${revalidated.id}`)) {
           target = `${revalidated.provider}/${revalidated.id}`;
           source = "matrix";
