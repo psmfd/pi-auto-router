@@ -16,6 +16,7 @@ import type { RoutingMatrix } from "./shared/routing-matrix.ts";
 import { getUsage } from "./shared/signals.ts";
 import { resolveAnthropicFilter } from "./anthropic-discovery.ts";
 import { classify, type ClassifierChoice, type CompleteFn } from "./classifier.ts";
+import { setModelEphemeral } from "./ephemeral-set-model.ts";
 import { resolveCopilotFilter, type FetchLike } from "./shared/copilot-discovery.ts";
 import { resolveOmlxFilter } from "./shared/omlx-discovery.ts";
 import {
@@ -243,7 +244,9 @@ export async function route(
   const model = ctx.modelRegistry.find(provider, id);
   if (!model) return { kind: "no-registry-model", target };
 
-  const ok = await pi.setModel(model);
+  // Ephemeral: never persist a ROUTED model as the user's global default
+  // (#533, ADR-0096) — manual /model picks are unaffected.
+  const ok = await setModelEphemeral(pi, model);
   if (!ok) return { kind: "no-credential", target };
   return reason === undefined
     ? { kind: "routed", target, cached, taskType, source }

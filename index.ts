@@ -22,6 +22,7 @@ import { defaultMatrixPath, gardenMatrix, loadRoutingMatrix, type RoutingMatrix 
 import { clearAnthropicCache } from "./anthropic-discovery.ts";
 import { hasExplicitModelFlag } from "./argv-guard.ts";
 import { clearCopilotCache } from "./shared/copilot-discovery.ts";
+import { setModelEphemeral } from "./ephemeral-set-model.ts";
 import { clearOmlxCache } from "./shared/omlx-discovery.ts";
 import { appendTaskRecord, buildTaskRecord, type AssistantMessageLike } from "./recorder.ts";
 import { route, type RouteContext, type RouteOutcome, type RoutePi } from "./route.ts";
@@ -519,7 +520,9 @@ export default function autoRouter(pi: ExtensionAPI): void {
       if (!ctx.model || modelKey(ctx.model) !== cfg.orchestratorModelLock) {
         applyingModelLock = true;
         try {
-          const ok = await pi.setModel(locked);
+          // Ephemeral for the same reason as routed picks (#533, ADR-0096):
+          // applying the lock must not rewrite the persisted global default.
+          const ok = await setModelEphemeral(pi, locked);
           if (!ok && ctx.hasUI) {
             ctx.ui.notify(
               `auto-router: no credential for locked orchestrator model ${cfg.orchestratorModelLock}; kept current`,
