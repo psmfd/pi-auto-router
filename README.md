@@ -271,8 +271,11 @@ ADR-0076.
 
 | Control | Effect |
 |---|---|
-| `/auto on` / `/auto off` | Toggle routing; persisted across sessions (`shared/state.ts`, namespace `auto-router`). |
-| `/auto status` (or `/auto`) | Show ON/OFF + the configured classifier model + matrix on/off + orchestrator model lock + primary provider restriction; appends `(inert: explicit --model)` when the precedence guard is active. |
+| `/auto` | Toggle routing ON/OFF; persisted across sessions (`shared/state.ts`, namespace `auto-router`). |
+| `/auto on` / `/auto off` | Explicit ON/OFF aliases for the same persisted routing toggle. |
+| `/auto status` | Show ON/OFF + the configured classifier model + matrix on/off + `preferLocalOmlx` + `localLlm.role` + orchestrator model lock + primary provider restriction; appends `(inert: explicit --model)` when the precedence guard is active. |
+| `/auto settings` | Interactive settings menu (non-freeform selections): routing toggle, matrix toggle, primary-provider selection checklist, lock-to-current/clear lock, and user-layer oMLX settings (`preferLocalOmlx`, `localLlm.role`). |
+| `/auto settings status` | Show the same consolidated status payload as `/auto status`. |
 | `/auto matrix on` / `/auto matrix off` | Toggle the deterministic capability-matrix override (#352); persisted; clears the decision cache. `/auto matrix` or `/auto matrix status` reports loaded path, row count, last-reviewed metadata, and staleness. |
 | `/auto matrix review` | User-invoked freshness workflow hint: reports matrix metadata and points to `scripts/analyze-routing-matrix.sh`; never rewrites policy automatically. |
 | `/auto lock current` / `/auto lock set <provider/id>` / `/auto lock clear` | Set or clear the exact parent/orchestrator model lock used while auto-router is active. |

@@ -214,6 +214,48 @@ async function readPreferLocalOmlxSetting(): Promise<boolean> {
   }
 }
 
+type UserSettingsJson = {
+  extensionSettings?: {
+    autoRouter?: { preferLocalOmlx?: unknown };
+    localLlm?: { role?: unknown };
+  };
+};
+
+function userSettingsPath(): string {
+  return path.join(os.homedir(), ".pi", "agent", "settings.json");
+}
+
+async function readUserSettings(): Promise<UserSettingsJson> {
+  const p = userSettingsPath();
+  try {
+    const raw = await fs.promises.readFile(p, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object") return parsed as UserSettingsJson;
+    return {};
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ENOENT") return {};
+    throw err;
+  }
+}
+
+async function writeUserSettings(next: UserSettingsJson): Promise<void> {
+  const p = userSettingsPath();
+  const dir = path.dirname(p);
+  await fs.promises.mkdir(dir, { recursive: true });
+  const tmp = path.join(dir, `.settings.json.tmp-${process.pid}-${Date.now()}`);
+  await fs.promises.writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  await fs.promises.rename(tmp, p);
+}
+
+async function updateUserSettings(
+  mutate: (current: UserSettingsJson) => UserSettingsJson,
+): Promise<void> {
+  const current = await readUserSettings();
+  const next = mutate(current);
+  await writeUserSettings(next);
+}
+
 export default function autoRouter(pi: ExtensionAPI): void {
   let cfg: state.RouterState = state.DEFAULT_STATE;
   const cache = new state.DecisionCache();
@@ -280,10 +322,169 @@ export default function autoRouter(pi: ExtensionAPI): void {
     if (ctx.model) showModel(ctx, ctx.model.provider, ctx.model.id);
   });
 
+  const formatAutoStatus = (): string => {
+    const flagOn = pi.getFlag("auto") === true;
+    const active = cfg.enabled || flagOn;
+    const inert = active && explicitModel ? " (inert: explicit --model)" : "";
+    return (
+      `auto-router: ${active ? "ON" : "OFF"}${flagOn && !cfg.enabled ? " (via --auto)" : ""}${inert}; ` +
+      `classifier=${cfg.classifierModel ?? "cheapest-available"}; ` +
+      `matrix=${cfg.matrixEnabled ? "on" : "off"}; ` +
+      `preferLocalOmlx=${preferLocalOmlx ? "on" : "off"}; ` +
+      `localRole=${localRole}; ` +
+      `orchestratorLock=${cfg.orchestratorModelLock ?? "none"}; ` +
+      `primaryProviders=${formatProviders(cfg.orchestratorAllowedProviders)}`
+    );
+  };
+
+  async function applyInteractiveSettings(ctx: ExtensionContext): Promise<void> {
+    if (!ctx.hasUI) {
+      return;
+    }
+    let nextCfg = cfg;
+    let nextPreferLocal = preferLocalOmlx;
+    let nextLocalRole = localRole;
+
+    const enable = await ctx.ui.confirm(
+      "auto-router settings",
+      `Enable auto-router? (currently ${cfg.enabled ? "ON" : "OFF"})`,
+    );
+    nextCfg = { ...nextCfg, enabled: enable };
+
+    const matrixOn = await ctx.ui.confirm(
+      "auto-router settings",
+      `Enable matrix routing override? (currently ${cfg.matrixEnabled ? "ON" : "OFF"})`,
+    );
+    nextCfg = { ...nextCfg, matrixEnabled: matrixOn };
+
+    const providers = [
+      ...new Set(
+        ctx.modelRegistry
+          .getAvailable()
+          .map((m) => m.provider.trim().toLowerCase())
+          .filter((p) => p.length > 0),
+      ),
+    ].sort();
+    const selectedProviders: string[] = [];
+    for (const provider of providers) {
+      const pick = await ctx.ui.confirm(
+        "auto-router settings",
+        `Allow primary provider "${provider}"? (${cfg.orchestratorAllowedProviders.includes(provider) ? "currently allowed" : "currently not allowed"})`,
+      );
+      if (pick) selectedProviders.push(provider);
+    }
+    nextCfg = { ...nextCfg, orchestratorAllowedProviders: selectedProviders };
+
+    if (ctx.model) {
+      const current = modelKey(ctx.model);
+      const lockCurrent = await ctx.ui.confirm(
+        "auto-router settings",
+        `Lock orchestrator model to current (${current})?`,
+      );
+      if (lockCurrent) {
+        if (nextLocalRole !== "full" && isLocalModelKey(current)) {
+          ctx.ui.notify(
+            `auto-router: refusing to lock ${current} — localLlm.role=${nextLocalRole} restricts local models; lock unchanged`,
+            "warning",
+          );
+        } else {
+          nextCfg = { ...nextCfg, orchestratorModelLock: current };
+        }
+      } else {
+        const clearLock = await ctx.ui.confirm(
+          "auto-router settings",
+          `Clear orchestrator lock? (currently ${cfg.orchestratorModelLock ?? "none"})`,
+        );
+        if (clearLock) nextCfg = { ...nextCfg, orchestratorModelLock: null };
+      }
+    }
+
+    nextPreferLocal = await ctx.ui.confirm(
+      "auto-router settings",
+      `Prefer local oMLX in classifier ordering? (currently ${preferLocalOmlx ? "ON" : "OFF"})`,
+    );
+
+    const allowLocalBeyondClassifier = await ctx.ui.confirm(
+      "auto-router settings",
+      `Allow local models beyond classifier-only use? (currently localLlm.role=${localRole})`,
+    );
+    if (allowLocalBeyondClassifier) {
+      nextLocalRole = "full";
+    } else {
+      const classifierOnly = await ctx.ui.confirm(
+        "auto-router settings",
+        "When restricted, keep local models for classifier-only (Yes) or disable local entirely (No)?",
+      );
+      nextLocalRole = classifierOnly ? "classifier-only" : "off";
+    }
+
+    if (nextCfg.orchestratorModelLock !== null && nextLocalRole !== "full" && isLocalModelKey(nextCfg.orchestratorModelLock)) {
+      ctx.ui.notify(
+        `auto-router: clearing local lock ${nextCfg.orchestratorModelLock} because localLlm.role=${nextLocalRole}`,
+        "warning",
+      );
+      nextCfg = { ...nextCfg, orchestratorModelLock: null };
+    }
+
+    const cfgChanged = JSON.stringify(nextCfg) !== JSON.stringify(cfg);
+    const userSettingsChanged = nextPreferLocal !== preferLocalOmlx || nextLocalRole !== localRole;
+
+    if (cfgChanged) {
+      cfg = nextCfg;
+      await state.save(cfg);
+      cache.clear();
+    }
+
+    if (userSettingsChanged) {
+      await updateUserSettings((current) => {
+        const extensionSettings = current.extensionSettings ?? {};
+        const autoRouter = extensionSettings.autoRouter ?? {};
+        const localLlm = extensionSettings.localLlm ?? {};
+        return {
+          ...current,
+          extensionSettings: {
+            ...extensionSettings,
+            autoRouter: { ...autoRouter, preferLocalOmlx: nextPreferLocal },
+            localLlm: { ...localLlm, role: nextLocalRole },
+          },
+        };
+      });
+      preferLocalOmlx = nextPreferLocal;
+      localRole = nextLocalRole;
+    }
+
+    if (!cfgChanged && !userSettingsChanged) {
+      ctx.ui.notify("auto-router: settings unchanged", "info");
+      return;
+    }
+    ctx.ui.notify(formatAutoStatus(), "info");
+  }
+
   pi.registerCommand("auto", {
-    description: "Auto model routing: /auto [on|off|status|matrix on|matrix off|lock current|lock set provider/id|lock clear|primary copilot|primary clear]",
+    description:
+      "Auto model routing: /auto [toggle|status|settings|on|off|matrix on|matrix off|lock current|lock set provider/id|lock clear|primary copilot|primary clear]",
     handler: async (args, ctx) => {
       const parts = (args ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+      if (parts[0] === "settings") {
+        const sub = parts[1] ?? "";
+        if (sub === "status") {
+          ctx.ui.notify(formatAutoStatus(), "info");
+          return;
+        }
+        if (sub !== "") {
+          ctx.ui.notify("auto-router: /auto settings supports only 'status' or interactive mode", "warning");
+          return;
+        }
+        try {
+          await applyInteractiveSettings(ctx);
+        } catch (err) {
+          ctx.ui.notify(
+            `auto-router: could not update settings (${err instanceof Error ? err.message : String(err)})`,
+            "error",
+          );
+        }
+        return;
+      }
       if (parts[0] === "matrix") {
         // #352 (ADR-0078): toggle the deterministic capability-matrix override.
         // ADR-0090/#660: status/review are user-invoked and never mutate the
@@ -431,9 +632,10 @@ export default function autoRouter(pi: ExtensionAPI): void {
         return;
       }
       const sub = parts[0] ?? "";
-      if (sub === "on" || sub === "off") {
-        cfg = { ...cfg, enabled: sub === "on" };
-        if (sub === "on" && cfg.orchestratorModelLock === null && ctx.model) {
+      const effectiveSub = sub === "" ? (cfg.enabled ? "off" : "on") : sub;
+      if (effectiveSub === "on" || effectiveSub === "off") {
+        cfg = { ...cfg, enabled: effectiveSub === "on" };
+        if (effectiveSub === "on" && cfg.orchestratorModelLock === null && ctx.model) {
           // ADR-0094 review fix: /auto on is a lock-WRITE site like
           // lock current/set and the model_select capture — a live local
           // model must not be persisted while the lever restricts local.
@@ -448,18 +650,7 @@ export default function autoRouter(pi: ExtensionAPI): void {
         }
         await state.save(cfg);
       }
-      const flagOn = pi.getFlag("auto") === true;
-      const active = cfg.enabled || flagOn;
-      const inert = active && explicitModel ? " (inert: explicit --model)" : "";
-      ctx.ui.notify(
-        `auto-router: ${active ? "ON" : "OFF"}${flagOn && !cfg.enabled ? " (via --auto)" : ""}${inert}; ` +
-          `classifier=${cfg.classifierModel ?? "cheapest-available"}; ` +
-          `matrix=${cfg.matrixEnabled ? "on" : "off"}; ` +
-          `localRole=${localRole}; ` +
-          `orchestratorLock=${cfg.orchestratorModelLock ?? "none"}; ` +
-          `primaryProviders=${formatProviders(cfg.orchestratorAllowedProviders)}`,
-        "info",
-      );
+      ctx.ui.notify(formatAutoStatus(), "info");
     },
   });
 
