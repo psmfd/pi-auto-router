@@ -61,6 +61,14 @@ export interface RefreshMetadata {
 export interface RoutingMatrix {
   readonly v: number;
   readonly lastReviewed: string;
+  /**
+   * Staleness threshold in days for the review-age WARN surfaces (#686).
+   * The committed matrix is the single source of this value — validate.sh's
+   * 9b gate and auto-router's `(stale)` flag both read it from here.
+   * Optional only for externally-supplied matrices; consumers fall back
+   * to 180.
+   */
+  readonly staleAfterDays?: number;
   /** Present only when a refresh has recorded its audit block (#660). */
   readonly refresh?: RefreshMetadata;
   /**

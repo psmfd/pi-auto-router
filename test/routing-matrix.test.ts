@@ -2,14 +2,17 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 
+import { defaultMatrixPath } from "../shared/routing-matrix.ts";
 import { TASK_TYPES } from "../types.ts";
 
-// Schema sanity for the hand-authored capability floor (#363, consumed by
-// #352). The file lives in shared/ (it will be read by shared's
-// resolveByTaskType in #352), but the taxonomy source of truth is
-// auto-router/types.ts — extensions import from shared, never the reverse, so
-// the membership check lives here.
-const MATRIX_URL = new URL("../../shared/routing-matrix.json", import.meta.url);
+// Schema sanity for the hand-authored capability floor (#363, loaded by
+// shared/routing-matrix.ts for auto-router's matrix routing, #352). The file
+// lives in shared/, but the taxonomy source of truth is auto-router/types.ts —
+// extensions import from shared, never the reverse, so the membership check
+// lives here. The path comes from defaultMatrixPath() (module-adjacent, so it
+// resolves in both the monorepo and the vendored mirror layout — #736), while
+// the read stays raw readFile: these tests assert on raw-file fields
+// (rationale, lastReviewed format) that loadRoutingMatrix() would drop.
 
 interface MatrixRow {
   readonly capable: readonly string[];
@@ -22,7 +25,7 @@ interface Matrix {
 }
 
 async function loadMatrix(): Promise<Matrix> {
-  return JSON.parse(await readFile(MATRIX_URL, "utf8")) as Matrix;
+  return JSON.parse(await readFile(defaultMatrixPath(), "utf8")) as Matrix;
 }
 
 test("routing-matrix.json parses with the v1 shape", async () => {

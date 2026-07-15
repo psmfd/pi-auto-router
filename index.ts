@@ -148,7 +148,10 @@ function formatMatrixStatus(matrix: RoutingMatrix | null): string {
   // paste; nothing programmatic writes the matrix).
   const freshness = matrix.refresh?.at ?? matrix.lastReviewed;
   const age = matrixAgeDays(freshness);
-  const ageText = age === null ? "unknown age" : `${age}d old${age > 180 ? " (stale)" : ""}`;
+  // Threshold single-sourced from the matrix itself (#686); 180 is only the
+  // fallback for externally-supplied matrices that predate staleAfterDays.
+  const staleAfter = matrix.staleAfterDays ?? 180;
+  const ageText = age === null ? "unknown age" : `${age}d old${age > staleAfter ? " (stale)" : ""}`;
   const refreshText = matrix.refresh
     ? `; refreshed=${matrix.refresh.at} via ${matrix.refresh.tool} (${matrix.refresh.source})`
     : "; refresh metadata absent (see scripts/analyze-routing-matrix.sh --suggest-refresh-metadata)";
