@@ -100,6 +100,27 @@ test("orderClassifierModels puts the configured model first when available", () 
   assert.deepEqual(orderClassifierModels(cands, "anthropic/missing").map((c) => c.id), ["haiku", "opus"]);
 });
 
+test("orderClassifierModels breaks equal cost/window ties by provider/id, independent of input order", () => {
+  const alpha = cand("provider-a", "alpha", 0, 128_000);
+  const zed = cand("provider-z", "zed", 0, 128_000);
+  const forward = orderClassifierModels([zed, alpha], null, false).map((c) => `${c.provider}/${c.id}`);
+  const reversed = orderClassifierModels([alpha, zed], null, false).map((c) => `${c.provider}/${c.id}`);
+  assert.deepEqual(forward, ["provider-a/alpha", "provider-z/zed"]);
+  assert.deepEqual(reversed, forward);
+});
+
+test("orderClassifierModels keeps lexical ties deterministic inside the default omlx partition", () => {
+  const candidates = [
+    cand("provider-z", "zed", 0, 128_000),
+    cand("omlx", "zed", 0, 128_000),
+    cand("provider-a", "alpha", 0, 128_000),
+    cand("omlx", "alpha", 0, 128_000),
+  ];
+  const expected = ["omlx/alpha", "omlx/zed", "provider-a/alpha", "provider-z/zed"];
+  assert.deepEqual(orderClassifierModels(candidates, null).map((c) => `${c.provider}/${c.id}`), expected);
+  assert.deepEqual(orderClassifierModels([...candidates].reverse(), null).map((c) => `${c.provider}/${c.id}`), expected);
+});
+
 // --- #363: cost-0 local workhorse in the classifier rotation ----------------
 // Decision recorded for #519's ADR: the cost stays an honest 0 (no nominal
 // fudge — that would corrupt the #351/#520 observed-cost data), so the local

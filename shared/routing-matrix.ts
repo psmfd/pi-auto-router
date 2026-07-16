@@ -3,22 +3,23 @@
  * floor (`routing-matrix.json`, seeded in #363; consulted by auto-router's
  * matrix routing since #352, ADR-0078).
  *
- * Same conventions as token-meter's `loadTierMap`: the committed JSON lives
- * next to this module and loading is fail-soft. Unlike the tier map, failure
- * yields `null` — NOT an empty object — because "absent" must be
- * distinguishable from "present but empty": `null` is exactly the signal
- * `resolveByTaskType` treats as "matrix unavailable → the classifier's pick
- * stands". Matrix routing degrades to classifier routing; it never breaks a
- * turn. Malformed individual rows are dropped, keeping the rest of the file
- * usable (mirrors loadTierMap's per-entry filtering).
+ * The committed JSON lives next to this module. Loading is strict and
+ * diagnosable: malformed policy yields a typed failure, while the legacy
+ * `loadRoutingMatrix()` adapter preserves fail-soft `null` semantics for
+ * routing callers. Matrix routing therefore still degrades to classifier
+ * routing and never breaks a turn, but status/review surfaces can explain why.
  *
- * `capable[]` stays `readonly string[]` here rather than the TaskType union:
- * extensions import from shared, never the reverse, so this module cannot see
- * auto-router's taxonomy. Consumers match entries against their own TaskType.
+ * `capable[]` remains `readonly string[]` in the public matrix shape for
+ * compatibility with synthetic callers; the strict loader validates every
+ * entry against the shared `MATRIX_TASK_TYPES` source of truth.
  */
 
 import { promises as fs } from "node:fs";
 import { fileURLToPath } from "node:url";
+
+import { MATRIX_TASK_TYPES } from "./task-types.ts";
+
+export { MATRIX_TASK_TYPES } from "./task-types.ts";
 
 /**
  * Quality tier of a matrix row (#656, ADR-0094 layer 3 follow-on). Coarse by
@@ -32,11 +33,47 @@ export function parseMatrixTier(value: unknown): MatrixTier | undefined {
   return value === "frontier" || value === "capable" || value === "fast" ? value : undefined;
 }
 
+/** Current on-disk matrix schema version. */
+export const MATRIX_VERSION = 1;
+
+export type MatrixDiagnosticCode =
+  | "missing"
+  | "unreadable"
+  | "invalid-json"
+  | "unsupported-version"
+  | "invalid-schema"
+  | "stale";
+
+export interface MatrixDiagnostic {
+  readonly code: MatrixDiagnosticCode;
+  readonly severity: "error" | "warning";
+  readonly message: string;
+  /** Structured row/field context for read-only review proposals. */
+  readonly row?: string;
+  readonly field?: "capable" | "rationale" | "tier";
+}
+
+export type MatrixLoadResult =
+  | {
+      readonly ok: true;
+      readonly path: string;
+      readonly matrix: RoutingMatrix;
+      readonly diagnostics: readonly MatrixDiagnostic[];
+    }
+  | {
+      readonly ok: false;
+      readonly path: string;
+      readonly matrix: null;
+      readonly diagnostics: readonly MatrixDiagnostic[];
+    };
+
 export interface MatrixEntry {
   /** Task-type labels this model clears the capability bar for. */
   readonly capable: readonly string[];
   /** Quality tier for tier-requested selection (#656); absent = untiered. */
   readonly tier?: MatrixTier;
+  /** Human-reviewed evidence. Strict file loads always retain it; synthetic routing callers may omit it. */
+  readonly rationale?: string;
 }
 
 /**
@@ -126,68 +163,198 @@ export function gardenMatrix(
   return { danglingRows, unlistedByProvider };
 }
 
-/**
- * Load and shape-check the routing matrix. Any failure — missing file,
- * unreadable, malformed JSON, `models` not an object — yields `null`.
- */
-export async function loadRoutingMatrix(path?: string): Promise<RoutingMatrix | null> {
-  try {
-    const raw = await fs.readFile(path ?? defaultMatrixPath(), "utf8");
-    const parsed = JSON.parse(raw) as {
-      v?: unknown;
-      lastReviewed?: unknown;
-      refresh?: unknown;
-      models?: unknown;
-    } | null;
-    if (
-      parsed === null ||
-      typeof parsed !== "object" ||
-      typeof parsed.models !== "object" ||
-      parsed.models === null ||
-      Array.isArray(parsed.models)
-    ) {
-      return null;
-    }
-    const models: Record<string, MatrixEntry> = {};
-    for (const [key, value] of Object.entries(parsed.models)) {
-      const row = value as { capable?: unknown; tier?: unknown } | null;
-      const capable = row?.capable;
-      if (!Array.isArray(capable)) continue;
-      const tier = parseMatrixTier(row?.tier);
-      models[key] = {
-        capable: capable.filter((t): t is string => typeof t === "string"),
-        ...(tier ? { tier } : {}),
-      };
-    }
-    // #660: the refresh audit block is optional and fail-soft — a malformed
-    // block is dropped (matrix still loads) rather than failing the file.
-    let refresh: RefreshMetadata | undefined;
-    const rawRefresh = parsed.refresh as
-      | { at?: unknown; tool?: unknown; source?: unknown; inputsHash?: unknown }
-      | null
-      | undefined;
-    if (
-      rawRefresh !== null &&
-      typeof rawRefresh === "object" &&
-      typeof rawRefresh.at === "string" &&
-      typeof rawRefresh.tool === "string" &&
-      typeof rawRefresh.source === "string"
-    ) {
-      refresh = {
-        at: rawRefresh.at,
-        tool: rawRefresh.tool,
-        source: rawRefresh.source,
-        ...(typeof rawRefresh.inputsHash === "string" ? { inputsHash: rawRefresh.inputsHash } : {}),
-      };
-    }
+const MODEL_KEY_PATTERN = /^[a-z0-9-]+\/[A-Za-z0-9._/-]+$/;
+const DATE_ONLY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
+const ISO_UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+const TASK_TYPE_SET: ReadonlySet<string> = new Set(MATRIX_TASK_TYPES);
 
-    return {
-      v: typeof parsed.v === "number" ? parsed.v : 0,
-      lastReviewed: typeof parsed.lastReviewed === "string" ? parsed.lastReviewed : "",
-      ...(refresh ? { refresh } : {}),
-      models,
-    };
-  } catch {
-    return null;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isValidDateOnly(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const match = DATE_ONLY_PATTERN.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return (
+    date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day
+  );
+}
+
+function failure(
+  path: string,
+  code: Exclude<MatrixDiagnosticCode, "stale">,
+  message: string,
+  context: Pick<MatrixDiagnostic, "row" | "field"> = {},
+): MatrixLoadResult {
+  return {
+    ok: false,
+    path,
+    matrix: null,
+    diagnostics: [{ code, severity: "error", message, ...context }],
+  };
+}
+
+function schemaFailure(
+  path: string,
+  message: string,
+  context: Pick<MatrixDiagnostic, "row" | "field"> = {},
+): MatrixLoadResult {
+  return failure(path, "invalid-schema", message, context);
+}
+
+function freshnessAgeDays(value: string, now: Date): number | null {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return null;
+  return Math.max(0, Math.floor((now.getTime() - timestamp) / 86_400_000));
+}
+
+/**
+ * Strictly load and validate the routing matrix, preserving typed diagnostics.
+ * Staleness is a warning and leaves the matrix usable; structural failures are
+ * errors with `matrix: null`. `now` is injectable for deterministic tests.
+ */
+export async function loadRoutingMatrixResult(
+  path = defaultMatrixPath(),
+  now = new Date(),
+): Promise<MatrixLoadResult> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(path, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unreadable";
+    return failure(path, code, code === "missing" ? "matrix file is missing" : "matrix file is unreadable");
   }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return failure(path, "invalid-json", "matrix file is not valid JSON");
+  }
+
+  if (!isRecord(parsed)) return schemaFailure(path, "matrix root must be an object");
+  if (parsed.v !== MATRIX_VERSION) {
+    return failure(path, "unsupported-version", `matrix version must be ${MATRIX_VERSION}`);
+  }
+  if (!isValidDateOnly(parsed.lastReviewed)) {
+    return schemaFailure(path, "lastReviewed must be a real YYYY-MM-DD date");
+  }
+  if (Date.parse(`${parsed.lastReviewed}T00:00:00Z`) > now.getTime()) {
+    return schemaFailure(path, "lastReviewed must not be in the future");
+  }
+  if (!Number.isInteger(parsed.staleAfterDays) || (parsed.staleAfterDays as number) <= 0) {
+    return schemaFailure(path, "staleAfterDays must be a positive integer");
+  }
+  if (!isRecord(parsed.models) || Object.keys(parsed.models).length === 0) {
+    return schemaFailure(path, "models must be a non-empty object");
+  }
+
+  const models: Record<string, MatrixEntry> = {};
+  for (const [key, value] of Object.entries(parsed.models).sort(([a], [b]) => a.localeCompare(b))) {
+    if (!MODEL_KEY_PATTERN.test(key)) {
+      return schemaFailure(path, `model key ${JSON.stringify(key)} must be provider/id`);
+    }
+    if (!isRecord(value)) return schemaFailure(path, `matrix row ${key} must be an object`);
+    const rawCapable = value.capable;
+    if (!Array.isArray(rawCapable) || rawCapable.length === 0) {
+      return schemaFailure(
+        path,
+        `matrix row ${key} must have a non-empty capable array`,
+        { row: key, field: "capable" },
+      );
+    }
+    if (!rawCapable.every((task) => typeof task === "string" && TASK_TYPE_SET.has(task))) {
+      return schemaFailure(
+        path,
+        `matrix row ${key} contains an unknown task type`,
+        { row: key, field: "capable" },
+      );
+    }
+    if (new Set(rawCapable).size !== rawCapable.length) {
+      return schemaFailure(
+        path,
+        `matrix row ${key} contains duplicate task types`,
+        { row: key, field: "capable" },
+      );
+    }
+    if (typeof value.rationale !== "string" || value.rationale.trim().length === 0) {
+      return schemaFailure(
+        path,
+        `matrix row ${key} must have a non-empty rationale`,
+        { row: key, field: "rationale" },
+      );
+    }
+    const tier = value.tier === undefined ? undefined : parseMatrixTier(value.tier);
+    if (value.tier !== undefined && tier === undefined) {
+      return schemaFailure(
+        path,
+        `matrix row ${key} has an invalid tier`,
+        { row: key, field: "tier" },
+      );
+    }
+    const capable = MATRIX_TASK_TYPES.filter((task) => rawCapable.includes(task));
+    models[key] = {
+      capable,
+      ...(tier ? { tier } : {}),
+      rationale: value.rationale,
+    };
+  }
+
+  let refresh: RefreshMetadata | undefined;
+  if (parsed.refresh !== undefined) {
+    if (!isRecord(parsed.refresh)) return schemaFailure(path, "refresh must be an object");
+    const { at, tool, source, inputsHash } = parsed.refresh;
+    if (
+      typeof at !== "string" ||
+      !ISO_UTC_TIMESTAMP_PATTERN.test(at) ||
+      !Number.isFinite(Date.parse(at))
+    ) {
+      return schemaFailure(path, "refresh.at must be an ISO 8601 UTC timestamp");
+    }
+    if (Date.parse(at) > now.getTime()) {
+      return schemaFailure(path, "refresh.at must not be in the future");
+    }
+    if (typeof tool !== "string" || tool.trim().length === 0) {
+      return schemaFailure(path, "refresh.tool must be a non-empty string");
+    }
+    if (typeof source !== "string" || source.trim().length === 0) {
+      return schemaFailure(path, "refresh.source must be a non-empty string");
+    }
+    if (inputsHash !== undefined && (typeof inputsHash !== "string" || inputsHash.trim().length === 0)) {
+      return schemaFailure(path, "refresh.inputsHash must be a non-empty string when present");
+    }
+    refresh = { at, tool, source, ...(typeof inputsHash === "string" ? { inputsHash } : {}) };
+  }
+
+  const staleAfterDays = parsed.staleAfterDays as number;
+  const matrix: RoutingMatrix = {
+    v: MATRIX_VERSION,
+    lastReviewed: parsed.lastReviewed,
+    staleAfterDays,
+    ...(refresh ? { refresh } : {}),
+    models,
+  };
+  const freshness = refresh?.at ?? matrix.lastReviewed;
+  const age = freshnessAgeDays(freshness, now);
+  const diagnostics: MatrixDiagnostic[] = [];
+  if (age !== null && age > staleAfterDays) {
+    diagnostics.push({
+      code: "stale",
+      severity: "warning",
+      message: `matrix freshness is ${age} days old (threshold ${matrix.staleAfterDays} days)`,
+    });
+  }
+  return { ok: true, path, matrix, diagnostics };
+}
+
+/** Fail-soft compatibility adapter used by routing paths that need only policy. */
+export async function loadRoutingMatrix(path?: string): Promise<RoutingMatrix | null> {
+  return (await loadRoutingMatrixResult(path)).matrix;
 }

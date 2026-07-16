@@ -21,6 +21,7 @@ interface MatrixRow {
 interface Matrix {
   readonly v: number;
   readonly lastReviewed: string;
+  readonly staleAfterDays: number;
   readonly models: Readonly<Record<string, MatrixRow>>;
 }
 
@@ -32,6 +33,7 @@ test("routing-matrix.json parses with the v1 shape", async () => {
   const m = await loadMatrix();
   assert.equal(m.v, 1);
   assert.match(m.lastReviewed, /^\d{4}-\d{2}-\d{2}$/);
+  assert.ok(Number.isInteger(m.staleAfterDays) && m.staleAfterDays > 0);
   assert.ok(Object.keys(m.models).length >= 1);
 });
 

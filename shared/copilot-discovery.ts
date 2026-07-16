@@ -33,6 +33,7 @@ const FALLBACK_BASE = "https://api.individual.githubcopilot.com";
 const MAX_BODY_BYTES = 256 * 1024;
 const VALID_ID = /^[\w.\-/]{1,200}$/;
 const CACHE_TTL_MS = 20 * 60 * 1000; // inside the ~25-min JWT lifecycle
+const DISCOVERY_TIMEOUT_MS = 5_000;
 
 /** Minimal response shape we depend on (global `fetch`'s Response satisfies it). */
 export interface FetchResponseLike {
@@ -51,6 +52,8 @@ export interface DiscoveryDeps {
   readonly fetchFn?: FetchLike;
   readonly now?: () => number;
   readonly signal?: AbortSignal | undefined;
+  /** Internal deadline override for deterministic tests. */
+  readonly timeoutMs?: number;
 }
 
 /**
@@ -93,6 +96,24 @@ export function parseEnabledModels(body: string): Set<string> | null {
  * null on ANY failure (no token, bad base, non-2xx, oversized/malformed body,
  * redirect, zero enabled). Pure given an injected `fetchFn`.
  */
+function boundedSignal(signal?: AbortSignal, timeoutMs = DISCOVERY_TIMEOUT_MS): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("discovery aborted");
+}
+
+async function awaitWithSignal<T>(value: Promise<T> | T, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw abortError(signal);
+  return await new Promise<T>((resolve, reject) => {
+    const abort = () => reject(abortError(signal));
+    signal.addEventListener("abort", abort, { once: true });
+    Promise.resolve(value).then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
 export async function fetchCopilotEnabledModels(
   auth: { readonly ok: boolean; readonly apiKey?: string | undefined; readonly headers?: Record<string, string> | undefined },
   deps: DiscoveryDeps = {},
@@ -116,7 +137,7 @@ export async function fetchCopilotEnabledModels(
     const res = await fetchFn(`${base}/models`, {
       headers: { ...(auth.headers ?? {}), Authorization: `Bearer ${auth.apiKey}` },
       redirect: "error", // a redirect must never carry the Bearer token off-host
-      ...(deps.signal ? { signal: deps.signal } : {}),
+      signal: boundedSignal(deps.signal, deps.timeoutMs),
     });
     if (!res.ok) return null;
     const text = await res.text();
@@ -130,10 +151,12 @@ export async function fetchCopilotEnabledModels(
 // Module-level cache: model-id sets only (NEVER the JWT), one Copilot account
 // per process, expired on a wall-clock TTL inside the JWT lifetime.
 let cache: { models: Set<string>; expiresAt: number } | undefined;
+let cacheEpoch = 0;
 
-/** Clear the discovery cache (called on session_start; used in tests). */
+/** Clear the discovery cache and invalidate every older in-flight write. */
 export function clearCopilotCache(): void {
   cache = undefined;
+  cacheEpoch += 1;
 }
 
 /** Cached wrapper around {@link fetchCopilotEnabledModels} (20-min TTL). */
@@ -143,8 +166,11 @@ export async function getEnabledCopilotModels(
 ): Promise<Set<string> | null> {
   const now = (deps.now ?? Date.now)();
   if (cache && now < cache.expiresAt) return cache.models;
+  const epoch = ++cacheEpoch;
   const models = await fetchCopilotEnabledModels(auth, deps);
-  if (models !== null) cache = { models, expiresAt: now + CACHE_TTL_MS };
+  if (models !== null && epoch === cacheEpoch) {
+    cache = { models, expiresAt: now + CACHE_TTL_MS };
+  }
   return models;
 }
 
@@ -169,13 +195,14 @@ export async function resolveCopilotFilter(
   deps: DiscoveryDeps = {},
 ): Promise<Set<string> | null> {
   try {
-    const available = await ctx.modelRegistry.getAvailable();
+    const signal = boundedSignal(deps.signal, deps.timeoutMs);
+    const available = await awaitWithSignal(ctx.modelRegistry.getAvailable(), signal);
     const copilot = available.find((m) => m.provider === "github-copilot");
     if (!copilot) return null; // no copilot models → no filtering needed
     const model = ctx.modelRegistry.find(copilot.provider, copilot.id);
     if (!model) return null;
-    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-    return await getEnabledCopilotModels(auth, deps);
+    const auth = await awaitWithSignal(ctx.modelRegistry.getApiKeyAndHeaders(model), signal);
+    return await getEnabledCopilotModels(auth, { ...deps, signal });
   } catch {
     return null;
   }

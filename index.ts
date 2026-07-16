@@ -7,7 +7,7 @@
  * falls back to the current model. `/auto [on|off|status]` and `--auto` control
  * it; state persists across sessions via shared/state.
  *
- * Verified against pi v0.79.0 (Phase 0 #328): event lifecycle, `pi.setModel`,
+ * Verified against pi v0.80.6-psmfd.1: event lifecycle, `pi.setModel`,
  * `ctx.modelRegistry.{getAvailable,getApiKeyAndHeaders,find}`, and pi-ai
  * `complete()`. See ADR-0031.
  */
@@ -17,17 +17,42 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import {
+  clearAvailabilitySnapshot,
+  getAvailabilitySnapshot,
+  peekAvailabilitySnapshot,
+  type AvailabilitySnapshot,
+  type AvailabilitySnapshotContext,
+} from "./shared/availability-snapshot.ts";
+import { clearAnthropicCache } from "./shared/anthropic-discovery.ts";
 import { DEFAULT_LOCAL_ROLE, isLocalModelKey, readLocalRole, type LocalRole } from "./shared/local-role.ts";
-import { defaultMatrixPath, gardenMatrix, loadRoutingMatrix, type RoutingMatrix } from "./shared/routing-matrix.ts";
-import { clearAnthropicCache } from "./anthropic-discovery.ts";
+import {
+  loadRoutingMatrixResult,
+  type MatrixLoadResult,
+  type RoutingMatrix,
+} from "./shared/routing-matrix.ts";
 import { hasExplicitModelFlag } from "./argv-guard.ts";
 import { clearCopilotCache } from "./shared/copilot-discovery.ts";
 import { setModelEphemeral } from "./ephemeral-set-model.ts";
 import { clearOmlxCache } from "./shared/omlx-discovery.ts";
+import {
+  buildMatrixReviewPayload,
+  formatMatrixReviewHuman,
+  formatMatrixReviewJson,
+} from "./matrix-review.ts";
+import { refreshMatrixRuntime } from "./matrix-runtime.ts";
+import {
+  buildMatrixStatusPayload,
+  formatMatrixStatusHuman,
+  formatMatrixStatusJson,
+} from "./matrix-status.ts";
 import { appendTaskRecord, buildTaskRecord, type AssistantMessageLike } from "./recorder.ts";
 import { route, type RouteContext, type RouteOutcome, type RoutePi } from "./route.ts";
 import * as state from "./state.ts";
 import type { PickSource, TaskType } from "./types.ts";
+
+export const AUTO_COMMAND_DESCRIPTION =
+  "Auto model routing: /auto [status|settings [status]|on|off|matrix [status [--json]|review [--json]|refresh [--retry-unavailable]|on|off]|lock [status|current|set provider/id|clear]|(primary|orchestrator) [status|copilot|clear|providers [status|clear|set provider...|add provider...|remove provider...]]]";
 
 /** Persistent status-bar segment showing the model currently in use. */
 function showModel(ctx: ExtensionContext, provider: string, id: string): void {
@@ -133,67 +158,6 @@ function splitModelKey(value: string): { provider: string; id: string } {
   return { provider: value.slice(0, slash), id: value.slice(slash + 1) };
 }
 
-function matrixAgeDays(lastReviewed: string, now = new Date()): number | null {
-  const t = Date.parse(lastReviewed);
-  if (!Number.isFinite(t)) return null;
-  return Math.max(0, Math.floor((now.getTime() - t) / 86_400_000));
-}
-
-function formatMatrixStatus(matrix: RoutingMatrix | null): string {
-  if (!matrix) return "routing-matrix.json not loaded — classifier picks apply";
-  const rows = Object.keys(matrix.models).length;
-  // #660: freshness is judged by the most recent human touch — the refresh
-  // audit block when present, else lastReviewed. Refresh metadata is only
-  // ever written by the human editing the file (tooling prints a snippet to
-  // paste; nothing programmatic writes the matrix).
-  const freshness = matrix.refresh?.at ?? matrix.lastReviewed;
-  const age = matrixAgeDays(freshness);
-  // Threshold single-sourced from the matrix itself (#686); 180 is only the
-  // fallback for externally-supplied matrices that predate staleAfterDays.
-  const staleAfter = matrix.staleAfterDays ?? 180;
-  const ageText = age === null ? "unknown age" : `${age}d old${age > staleAfter ? " (stale)" : ""}`;
-  const refreshText = matrix.refresh
-    ? `; refreshed=${matrix.refresh.at} via ${matrix.refresh.tool} (${matrix.refresh.source})`
-    : "; refresh metadata absent (see scripts/analyze-routing-matrix.sh --suggest-refresh-metadata)";
-  return `path=${defaultMatrixPath()}; rows=${rows}; lastReviewed=${matrix.lastReviewed || "<missing>"}; ${ageText}${refreshText}`;
-}
-
-/**
- * Matrix gardening surface (#656 follow-through): compare the live registry
- * against the matrix rows on the read-only status/review commands. Dangling
- * rows (provider onboarded, exact id gone) are actionable and named;
- * unlisted credentialed models are summarized as per-provider counts (the
- * registry lists dozens of ids — enumerating them would be noise). Runtime
- * only — CI cannot see this host's credentials, so validate.sh carries just
- * the static schema checks. Fails soft to an empty string: gardening must
- * never break a status command.
- */
-async function formatMatrixGardening(
-  matrix: RoutingMatrix | null,
-  ctx: ExtensionContext,
-): Promise<string> {
-  if (!matrix) return "";
-  try {
-    const available = await Promise.resolve(
-      (ctx.modelRegistry as { getAvailable(): { provider: string; id: string }[] }).getAvailable(),
-    );
-    const keys = new Set(available.map((m) => `${m.provider}/${m.id}`));
-    const g = gardenMatrix(matrix, keys);
-    const parts: string[] = [];
-    if (g.danglingRows.length > 0) {
-      parts.push(`DANGLING rows (provider onboarded, id not in registry — fix or remove): ${g.danglingRows.join(", ")}`);
-    }
-    const unlisted = Object.entries(g.unlistedByProvider)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([p, n]) => `${p}:${n}`)
-      .join(" ");
-    if (unlisted) parts.push(`credentialed models without a matrix row: ${unlisted}`);
-    return parts.length > 0 ? `; gardening — ${parts.join("; ")}` : "";
-  } catch {
-    return "";
-  }
-}
-
 /**
  * Read the USER-layer `extensionSettings.autoRouter.preferLocalOmlx` override
  * (ADR-0084). Project-layer settings are deliberately not consulted — same
@@ -265,6 +229,7 @@ export default function autoRouter(pi: ExtensionAPI): void {
   // The hand-authored capability floor (#352, ADR-0078): loaded per session,
   // null when missing/malformed (matrix routing degrades to classifier picks).
   let matrix: RoutingMatrix | null = null;
+  let matrixLoad: MatrixLoadResult | null = null;
   // `provider/id`s that returned a provider error (e.g. 429) this session — skipped
   // as both classifier and routing targets until the next session.
   const unavailable = new Set<string>();
@@ -306,7 +271,8 @@ export default function autoRouter(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     cfg = await state.load();
-    matrix = await loadRoutingMatrix(); // per-session reload: edits apply next session (#352)
+    matrixLoad = await loadRoutingMatrixResult(); // per-session reload: edits apply next session (#352)
+    matrix = matrixLoad.matrix;
     unavailable.clear(); // give quota-recovered models a fresh chance each session
     // ADR-0094 review fix: routing decisions cache the resolved TARGET, and a
     // cache hit bypasses the two-pool lever filtering in buildRoutingPrompt —
@@ -314,6 +280,7 @@ export default function autoRouter(pi: ExtensionAPI): void {
     // lever (read once per session, next line block) has been restricted.
     // route() also re-checks hits defensively; this is the session boundary.
     cache.clear();
+    clearAvailabilitySnapshot(); // freeze a new shared parent/subagent generation this session
     clearCopilotCache(); // re-discover live Copilot availability each session
     clearAnthropicCache(); // re-discover live Anthropic availability each session (#538)
     clearOmlxCache(); // re-probe local oMLX availability each session (#364)
@@ -322,6 +289,10 @@ export default function autoRouter(pi: ExtensionAPI): void {
     preferLocalOmlx = await readPreferLocalOmlxSetting();
     localRole = await readLocalRole();
     localLockNotified = false;
+    if (!matrixLoad.ok && cfg.matrixEnabled && ctx.hasUI) {
+      const detail = matrixLoad.diagnostics.map((d) => `${d.code}: ${d.message}`).join("; ");
+      ctx.ui.notify(`auto-router: matrix unavailable — ${detail}; classifier picks apply`, "warning");
+    }
     if (ctx.model) showModel(ctx, ctx.model.provider, ctx.model.id);
   });
 
@@ -338,6 +309,48 @@ export default function autoRouter(pi: ExtensionAPI): void {
       `orchestratorLock=${cfg.orchestratorModelLock ?? "none"}; ` +
       `primaryProviders=${formatProviders(cfg.orchestratorAllowedProviders)}`
     );
+  };
+
+  const matrixStatusPayload = (
+    snapshot: AvailabilitySnapshot | null,
+    snapshotError?: string,
+  ) =>
+    buildMatrixStatusPayload({
+      enabled: cfg.matrixEnabled,
+      matrixLoad,
+      snapshot,
+      ...(snapshotError ? { snapshotError } : {}),
+      localRole,
+      preferLocalOmlx,
+      allowlist: cfg.allowlist,
+      providerAllowlist: cfg.orchestratorAllowedProviders,
+      unavailable,
+    });
+
+  const currentMatrixEvidence = async (ctx: ExtensionContext) => {
+    try {
+      const snapshot = await getAvailabilitySnapshot(
+        ctx as unknown as AvailabilitySnapshotContext,
+      );
+      return { snapshot, snapshotError: undefined } as const;
+    } catch {
+      return { snapshot: null, snapshotError: "snapshot-build-failed" } as const;
+    }
+  };
+
+  const currentMatrixStatusPayload = async (ctx: ExtensionContext) => {
+    const evidence = await currentMatrixEvidence(ctx);
+    return matrixStatusPayload(evidence.snapshot, evidence.snapshotError);
+  };
+
+  const currentMatrixReviewEvidence = async () => {
+    const current = peekAvailabilitySnapshot();
+    if (!current) return { snapshot: null, snapshotError: undefined } as const;
+    try {
+      return { snapshot: await current, snapshotError: undefined } as const;
+    } catch {
+      return { snapshot: null, snapshotError: "snapshot-build-failed" } as const;
+    }
   };
 
   async function applyInteractiveSettings(ctx: ExtensionContext): Promise<void> {
@@ -464,8 +477,7 @@ export default function autoRouter(pi: ExtensionAPI): void {
   }
 
   pi.registerCommand("auto", {
-    description:
-      "Auto model routing: /auto [toggle|status|settings|on|off|matrix on|matrix off|lock current|lock set provider/id|lock clear|primary copilot|primary clear]",
+    description: AUTO_COMMAND_DESCRIPTION,
     handler: async (args, ctx) => {
       const parts = (args ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean);
       if (parts[0] === "settings") {
@@ -489,31 +501,96 @@ export default function autoRouter(pi: ExtensionAPI): void {
         return;
       }
       if (parts[0] === "matrix") {
-        // #352 (ADR-0078): toggle the deterministic capability-matrix override.
-        // ADR-0090/#660: status/review are user-invoked and never mutate the
-        // matrix file; routing itself never silently refreshes this policy.
+        // ADR-0090/0104: all freshness actions are explicit and memory-only;
+        // no command writes the reviewed capability policy.
         const sub = parts[1] ?? "status";
+        const option = parts[2] ?? "";
         if (sub === "on" || sub === "off") {
+          if (option) {
+            ctx.ui.notify(`auto-router: /auto matrix ${sub} takes no options`, "warning");
+            return;
+          }
           cfg = { ...cfg, matrixEnabled: sub === "on" };
           await state.save(cfg);
-          // A prompt hash carries no dependency on the flag — decisions cached
-          // under the other mode would replay stale picks. Drop them all.
           cache.clear();
-        } else if (sub === "review") {
+        } else if (sub === "refresh") {
+          if ((option !== "" && option !== "--retry-unavailable") || parts.length > 3) {
+            ctx.ui.notify(
+              "auto-router: use /auto matrix refresh [--retry-unavailable]",
+              "warning",
+            );
+            return;
+          }
+          const refreshed = await refreshMatrixRuntime(
+            {
+              loadMatrix: () => loadRoutingMatrixResult(),
+              clearAvailabilitySnapshot,
+              clearCopilotCache,
+              clearAnthropicCache,
+              clearOmlxCache,
+              buildSnapshot: () =>
+                getAvailabilitySnapshot(ctx as unknown as AvailabilitySnapshotContext),
+              clearDecisionCache: () => cache.clear(),
+              unavailable,
+            },
+            option === "--retry-unavailable",
+          );
+          matrixLoad = refreshed.matrixLoad;
+          matrix = matrixLoad.matrix;
+          const payload = matrixStatusPayload(
+            refreshed.snapshot,
+            refreshed.snapshotError,
+          );
+          const retryText = refreshed.retriedUnavailable
+            ? "; session-unavailable set cleared"
+            : "; session-unavailable set preserved";
           ctx.ui.notify(
-            `auto-router: matrix review — ${formatMatrixStatus(matrix)}${await formatMatrixGardening(matrix, ctx)}. ` +
-              "Run scripts/analyze-routing-matrix.sh (--suggest-refresh-metadata for the audit block) and update routing-matrix.json in a reviewed PR; routing never auto-refreshes it.",
-            "info",
+            `auto-router: matrix refresh — ${formatMatrixStatusHuman(payload)}${retryText}`,
+            refreshed.matrixLoad.ok && refreshed.snapshot ? "info" : "warning",
           );
           return;
-        } else if (sub !== "status") {
+        } else if (sub === "review") {
+          if ((option !== "" && option !== "--json") || parts.length > 3) {
+            ctx.ui.notify("auto-router: use /auto matrix review [--json]", "warning");
+            return;
+          }
+          const evidence = await currentMatrixReviewEvidence();
+          const payload = buildMatrixReviewPayload({
+            matrixLoad,
+            snapshot: evidence.snapshot,
+            ...(evidence.snapshotError ? { snapshotError: evidence.snapshotError } : {}),
+            unavailable,
+          });
+          ctx.ui.notify(
+            option === "--json"
+              ? formatMatrixReviewJson(payload)
+              : `auto-router:\n${formatMatrixReviewHuman(payload)}`,
+            payload.matrix.state === "error" || payload.availability.state === "error"
+              ? "warning"
+              : "info",
+          );
+          return;
+        } else if (sub === "status") {
+          if ((option !== "" && option !== "--json") || parts.length > 3) {
+            ctx.ui.notify("auto-router: use /auto matrix status [--json]", "warning");
+            return;
+          }
+          const payload = await currentMatrixStatusPayload(ctx);
+          ctx.ui.notify(
+            option === "--json"
+              ? formatMatrixStatusJson(payload)
+              : `auto-router: ${formatMatrixStatusHuman(payload)}`,
+            payload.matrix.state === "error" || payload.availability.state === "error"
+              ? "warning"
+              : "info",
+          );
+          return;
+        } else {
           ctx.ui.notify("auto-router: unknown matrix action", "warning");
           return;
         }
-        ctx.ui.notify(
-          `auto-router: matrix ${cfg.matrixEnabled ? "ON" : "OFF"}; ${formatMatrixStatus(matrix)}${await formatMatrixGardening(matrix, ctx)}`,
-          "info",
-        );
+        const payload = await currentMatrixStatusPayload(ctx);
+        ctx.ui.notify(`auto-router: ${formatMatrixStatusHuman(payload)}`, "info");
         return;
       }
       if (parts[0] === "lock") {

@@ -13,6 +13,8 @@
 
 import type { complete } from "@earendil-works/pi-ai/compat";
 
+import { MATRIX_TASK_TYPES } from "./shared/task-types.ts";
+
 /** The pi-ai model object accepted by `complete()` and `pi.setModel()`. */
 export type RouterModel = Parameters<typeof complete>[0];
 
@@ -30,14 +32,7 @@ export interface Auth {
  * next to real token usage so the Phase 2 routing matrix is seeded from
  * observed per-task-type cost. It never influences the routing decision here.
  */
-export const TASK_TYPES = [
-  "simple-qa",
-  "code-edit",
-  "code-review",
-  "long-context",
-  "agentic-loop",
-  "creative",
-] as const;
+export const TASK_TYPES = MATRIX_TASK_TYPES;
 
 /** A taxonomy label, or "unknown" when the classifier omitted/invented one. */
 export type TaskType = (typeof TASK_TYPES)[number] | "unknown";

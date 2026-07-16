@@ -10,15 +10,18 @@
  * deterministic capability-matrix pick, both validated through the same gates.
  */
 
+import {
+  availabilityEvidenceSet,
+  getAvailabilitySnapshot,
+  type AvailabilitySnapshotContext,
+} from "./shared/availability-snapshot.ts";
 import { isLocalModelKey, type LocalRole } from "./shared/local-role.ts";
 import type { NotifyContext } from "./shared/notify.ts";
 import type { RoutingMatrix } from "./shared/routing-matrix.ts";
 import { getUsage } from "./shared/signals.ts";
-import { resolveAnthropicFilter } from "./anthropic-discovery.ts";
 import { classify, type ClassifierChoice, type CompleteFn } from "./classifier.ts";
 import { setModelEphemeral } from "./ephemeral-set-model.ts";
-import { resolveCopilotFilter, type FetchLike } from "./shared/copilot-discovery.ts";
-import { resolveOmlxFilter } from "./shared/omlx-discovery.ts";
+import type { FetchLike } from "./shared/copilot-discovery.ts";
 import {
   buildRoutingPrompt,
   orderClassifierModels,
@@ -127,36 +130,33 @@ export async function route(
   let reason: string | undefined;
 
   if (decision === undefined) {
-    // Live Copilot availability: drop tier-gated/picker-disabled github-copilot
-    // models the static catalog over-reports. Fails open to null (static menu).
-    const copilotFilter = await resolveCopilotFilter(ctx, {
+    // Build or reuse one session-frozen registry + live-provider generation.
+    // Parent and subagent policy import this same shared snapshot, preventing
+    // Copilot/Anthropic/oMLX filter drift and mixed-generation decisions.
+    const snapshot = await getAvailabilitySnapshot(ctx as unknown as AvailabilitySnapshotContext, {
       ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
       ...(ctx.signal ? { signal: ctx.signal } : {}),
-    }).catch(() => null);
-
-    // Live Anthropic availability (#538): drop retired ids the static registry
-    // still lists (they 404 when routed). Fails open to null.
-    const anthropicFilter = await resolveAnthropicFilter(ctx, {
-      ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
-    }).catch(() => null);
-
-    // Live oMLX availability (#364): drop the local candidate when the server
-    // is confirmed down or the model is not loaded. Fails open to null.
-    const omlxFilter = await resolveOmlxFilter(ctx, {
-      ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : {}),
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
-    }).catch(() => null);
-
+    });
     const providerAllowlist = cfg.orchestratorAllowedProviders.filter((p) => p.trim().length > 0);
+    const snapshotPolicyContext: PolicyContext = {
+      model: ctx.model,
+      getContextUsage: () => ctx.getContextUsage(),
+      modelRegistry: { getAvailable: () => snapshot.candidates },
+    };
 
     // The menu excludes models already known to be unavailable this session.
     // `providerAllowlist` is a primary/orchestrator-only restriction: it trims
     // the parent's routing menu but does not alter subagent child argv pins.
     const built = await buildRoutingPrompt(
-      ctx,
+      snapshotPolicyContext,
       prompt,
-      { allowlist: cfg.allowlist, providerAllowlist, copilotFilter, anthropicFilter, omlxFilter },
+      {
+        allowlist: cfg.allowlist,
+        providerAllowlist,
+        copilotFilter: availabilityEvidenceSet(snapshot.filters.copilot),
+        anthropicFilter: availabilityEvidenceSet(snapshot.filters.anthropic),
+        omlxFilter: availabilityEvidenceSet(snapshot.filters.omlx),
+      },
       unavailable,
       deps.localRole ?? "full",
     );

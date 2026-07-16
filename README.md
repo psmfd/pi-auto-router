@@ -17,7 +17,7 @@ Try it first without installing: `pi -e git:github.com/psmfd/pi-auto-router`.
 ## Flow
 
 1. `before_agent_start` fires once per prompt. If routing is off, no-op (manual `/model` is untouched). If the process was launched with an explicit `--model`, routing is **inert for the whole session** (see [Explicit `--model` precedence](#explicit---model-precedence-519-adr-0076)).
-2. `policy.ts` builds the **credentialed** candidate menu (`shared/candidates.ts` → `modelRegistry.getAvailable()`), each with a one-line cost/window hint, plus the current context-usage signal (`shared/signals.ts`) so high context pressure biases toward larger-window models. If a primary/orchestrator provider restriction is configured, the parent session's menu is first narrowed to those providers (for example, `github-copilot`) while subagent frontmatter pins remain unchanged. For `github-copilot`, `anthropic`, and `omlx`, the menu is also narrowed to live-available models (see [Copilot](#copilot-live-availability-adr-0035-343), [Anthropic](#anthropic-live-availability-538), and [oMLX](#omlx-live-availability-364) live availability).
+2. `shared/availability-snapshot.ts` reads the **credentialed** registry once, composes Copilot/Anthropic/oMLX live evidence over that exact observation, canonically sorts and hashes it, and freezes the generation for the session (ADR-0104). `policy.ts` builds the parent menu from those candidates with cost/window hints and current context pressure. A primary-provider restriction narrows only the parent menu; subagent policy consumes the same base snapshot with its own local-eligibility rules.
 3. `classifier.ts` calls a cheap model via pi-ai **`complete()`** (credentials resolved through `ctx.modelRegistry.getApiKeyAndHeaders()`), instructing it to return only `{"taskType":"<type>","model":"provider/id","reason":"…"}`. The task-type label is **measurement-only** (see [Task-type measurement](#task-type-measurement-351)); an invented or missing label degrades to `unknown` and never fails the parse.
 4. When **matrix routing** is enabled (the default since #353/ADR-0079; `/auto matrix off` opts out), the classifier's task-type label consults the hand-authored capability floor and the cheapest capable available model deterministically overrides the classifier's model choice (see [Matrix routing](#matrix-routing-352-adr-0078)); a matrix miss leaves the classifier's pick standing.
 5. The choice is resolved against the credentialed menu and applied via `pi.setModel(model)` — **ephemerally**: the runtime's `setModel` also persists its argument to `~/.pi/agent/settings.json` as the global default, so routed picks (and orchestrator-lock application) go through `ephemeral-set-model.ts`, which suppresses that persistence for the duration of the call only (#533, ADR-0096). Manual `/model` picks persist exactly as before. Retires when upstream ships a persist opt-out (earendil-works/pi#5263).
@@ -161,9 +161,9 @@ model choice with the **local-first cheapest capable available window-adequate**
    picks: a model absent from `routing-matrix.json` is never a *matrix* pick
    (the classifier may still choose it, so absence never removes a model from
    routing — the floor can only decline to override).
-2. **Availability** — the pick draws from the same live-filtered menu the
-   classifier saw (allowlist + Copilot/Anthropic/oMLX filters compose for
-   free) and re-checks the session `unavailable` set *after* the classify
+2. **Availability** — the pick draws from the same session-frozen canonical
+   snapshot the classifier saw (allowlist + Copilot/Anthropic/oMLX filters
+   compose once for parent and subagent) and re-checks the session `unavailable` set *after* the classify
    loop, which can 429 a model mid-loop.
 3. **Window adequacy** — a candidate already past `FORCE_COMPACT_AT` (90%,
    `shared/signals.ts`) on its *own* window at the current token count is
@@ -184,14 +184,96 @@ Any empty stage → typed `null` → the classifier's pick stands (`source:
 "classifier"`); a matrix pick that survives every gate routes with `source:
 "matrix"` — the toast shows `routed → provider/id [matrix]`, and the source is
 recorded on the cached decision and every task-type record. The matrix file is
-loaded fail-soft once per session (`shared/routing-matrix.ts`): missing or
-malformed ⇒ matrix routing silently degrades to classifier routing. Toggling
-`/auto matrix on|off` clears the decision cache (a prompt hash carries no flag
-dependency, so cross-mode cache replays would otherwise be stale).
-`validate.sh` guards the committed matrix (structure FAILs; `lastReviewed`
-staleness >180d and unpinned-key cross-reference WARN). Matrix freshness is
-explicitly user-invoked and auditable: routing never silently refreshes or
-rewrites this policy file while classifying a prompt.
+loaded strictly once per session (`shared/routing-matrix.ts`): typed failures
+surface to the operator while routing still degrades fail-soft to classifier
+picks. Toggling `/auto matrix on|off` clears the decision cache. `validate.sh`
+guards the committed matrix structure and freshness. Routing never silently
+refreshes or rewrites policy while classifying a prompt.
+
+### Explicit matrix status, review, and refresh (#749/#750)
+
+The versioned policy/status/review contract is
+[`MATRIX_LIFECYCLE_V1.md`](./MATRIX_LIFECYCLE_V1.md). It is the maintained field,
+state, hash/generation, side-effect, and standalone-path reference.
+
+```text
+/auto matrix status
+/auto matrix status --json
+/auto matrix refresh
+/auto matrix refresh --retry-unavailable
+/auto matrix review
+/auto matrix review --json
+```
+
+`status` builds or reuses the canonical availability snapshot and reports the
+matrix load state, diagnostics, generation/hash, static/live model counts,
+provider filter states, freshness source/threshold, actionable
+intersection/unlisted/inert/dangling/filtered coverage, effective
+local-role/allowlist inputs, session-unavailable models, and registry-reload
+guidance. Snapshot failures use a fixed typed code rather than raw provider
+errors. `--json` emits the stable v1 payload for audit or tooling.
+
+`refresh` is memory-only and explicit: it reloads the committed matrix, clears
+all three provider-discovery caches plus the shared snapshot and decision
+cache, then builds one new frozen generation. The clear aborts the prior
+snapshot generation, and cache epochs prevent an older in-flight provider
+request from repopulating evidence afterward. Building the replacement performs
+provider discovery and may resolve operator-configured credentials (including a
+`models.json` `!command` resolver), just like the first status build. It
+**preserves** the session 429/provider-error deny set by default;
+`--retry-unavailable` explicitly clears that set before rebuilding. Neither
+form writes capability policy.
+
+`review` is observational and uses only an existing frozen snapshot; it does
+not initiate discovery, credential resolution, or refresh evidence. If no
+snapshot exists, the report says evidence is not built and proposes an explicit
+refresh. It emits stable facts, observations, and human-action proposals plus a
+canonical evidence hash. The hash identifies normalized policy, snapshot hash,
+typed diagnostics, and transient unavailable inputs; it is not a signature of
+the rendered bytes or their generation/time display fields. Proposals identify
+additions, changes, or removals that a person should investigate and list the
+evidence required; they never infer or grant capabilities, select a tier, emit
+a patch, or write policy. `--json` emits the v1 review schema; identical frozen
+inputs produce byte-identical output, while a replacement generation changes
+its generation/time display metadata.
+Detail arrays are capped at 100 entries with explicit omitted counts, and
+retained rationale display is capped at 500 characters; full inputs still
+participate in the evidence hashes.
+
+Pi v0.80.6 exposes no documented extension API that reloads only the static
+model registry. If `~/.pi/agent/models.json` changed, open `/model` first (Pi
+reloads that file when the picker opens), then run `/auto matrix refresh`.
+
+#### Review terminology
+
+| Term | Meaning |
+|---|---|
+| Fact | Host/session-scoped registry, snapshot, and reviewed-policy evidence. It is not a universal capability claim. |
+| Observation | A deterministic classification such as live-unlisted, filtered-unlisted, inert, dangling, filtered, transiently unavailable, stale, or rationale/context conflict. |
+| Inert row | A reviewed row whose provider is absent from this host registry. It cannot participate here, but may be an intentional forward declaration. |
+| Proposal | A human-action item with required evidence. It changes nothing and grants no capability. |
+
+#### Standalone mirror review and source control
+
+The standalone `pi-auto-router` mirror ships this command and its inlined
+`shared/routing-matrix.json`; it does **not** depend on monorepo-only scripts or
+`jq`:
+
+1. If registry configuration changed, open `/model`, then explicitly run
+   `/auto matrix refresh`.
+2. Run `/auto matrix review` for a readable report or
+   `/auto matrix review --json` for an auditable artifact. Retain the evidence
+   hash with the review.
+3. Investigate each proposal using provider identity, capability, quality, and
+   rationale evidence. Availability, context size, and cost alone never prove
+   capability.
+4. Submit the evidence through source control. In this repository the canonical
+   path is `agent/extensions/shared/routing-matrix.json`; in the standalone
+   distribution it is `shared/routing-matrix.json`. The standalone file is a
+   synchronized distribution copy, so prefer an upstream issue/PR for durable
+   policy changes.
+5. A human edits the matrix and lands it through a reviewed PR. Run the package
+   tests before merge. No review or refresh command applies the change.
 
 ### Primary/orchestrator provider restriction (#552, ADR-0083)
 
@@ -215,14 +297,15 @@ router keeps the current model and reports that the restriction left no
 candidates instead of falling through to local.
 
 This split is intentionally scoped to auto-router's parent-session
-`pi.setModel()` path. Subagent children are still governed by
-`agent/agents/*.md` frontmatter pins and the subagent spawn-time gate:
-read-only specialists **without a `bash` tool** run on `omlx/coding-workhorse`,
-the review trio runs on `github-copilot/claude-opus-4.7`, and dropped local
-pins still take the Copilot fallback rung before the session default. Every
-**`bash`-capable (mutation-capable) agent is unpinned by policy and sticks to
-the primary** — the interactive agents and `helm-expert` per ADR-0085, `linter`
-per ADR-0082 — inheriting the active/default model as before.
+`pi.setModel()` path. Subagent children independently consume the same frozen
+availability snapshot and capability matrix. Thirteen first-party wrappers
+request local eligibility with `local-llm: true`; the review trio requests
+`capability-tier: frontier`; and local-forbidden wrappers (including `bash`
+tool surfaces) remove local candidates before matrix selection. No first-party
+wrapper currently carries an exact `model:` pin. Explicit third-party pins
+remain authoritative and still pass through the spawn-time liveness/fallback
+gate. A local-forbidden child with no non-local matrix pick fails closed rather
+than inheriting the parent primary or a possibly-local session default.
 
 ### Lock the orchestrator model while auto-router is active (ADR-0090)
 
@@ -276,13 +359,17 @@ ADR-0076.
 | `/auto status` | Show ON/OFF + the configured classifier model + matrix on/off + `preferLocalOmlx` + `localLlm.role` + orchestrator model lock + primary provider restriction; appends `(inert: explicit --model)` when the precedence guard is active. |
 | `/auto settings` | Interactive settings menu (non-freeform selections): routing toggle, matrix toggle, primary-provider selection checklist, lock-to-current/clear lock, and user-layer oMLX settings (`preferLocalOmlx`, `localLlm.role`). |
 | `/auto settings status` | Show the same consolidated status payload as `/auto status`. |
-| `/auto matrix on` / `/auto matrix off` | Toggle the deterministic capability-matrix override (#352); persisted; clears the decision cache. `/auto matrix` or `/auto matrix status` reports loaded path, row count, last-reviewed metadata, and staleness. |
-| `/auto matrix review` | User-invoked freshness workflow hint: reports matrix metadata and points to `scripts/analyze-routing-matrix.sh`; never rewrites policy automatically. |
-| `/auto lock current` / `/auto lock set <provider/id>` / `/auto lock clear` | Set or clear the exact parent/orchestrator model lock used while auto-router is active. |
-| `/auto primary copilot` | Restrict parent/orchestrator routing candidates to `github-copilot/*`; subagent pins are unchanged. |
+| `/auto matrix on` / `/auto matrix off` | Toggle the deterministic capability-matrix override (#352); persisted; clears the decision cache. |
+| `/auto matrix status [--json]` | Report typed matrix state, canonical snapshot generation/hash, provider evidence, coverage counts/rows, and effective policy inputs; JSON is stable schema v1. |
+| `/auto matrix refresh [--retry-unavailable]` | Explicitly reload matrix memory and provider/snapshot/decision caches without writing policy; preserves session-unavailable by default, clears it only with the retry flag. Open `/model` first after editing `models.json`. |
+| `/auto matrix review [--json]` | Emit a deterministic review report with canonical evidence hash, facts, observations, and human-action proposals. Uses the frozen snapshot; has no apply/write mode. |
+| `/auto lock status` / `/auto lock current` / `/auto lock set <provider/id>` / `/auto lock clear` | Inspect, set, or clear the exact parent/orchestrator model lock used while auto-router is active. |
+| `/auto primary copilot` | Restrict parent/orchestrator routing candidates to `github-copilot/*`; subagent matrix policy is unchanged. |
 | `/auto primary providers set <provider> [...]` | Restrict parent/orchestrator routing to the listed providers. |
 | `/auto primary providers add <provider> [...]` / `/auto primary providers remove <provider> [...]` | Edit the parent/orchestrator provider restriction. |
-| `/auto primary clear` | Clear the parent/orchestrator provider restriction and restore the unrestricted candidate menu. |
+| `/auto primary status` / `/auto primary providers status` | Inspect the parent/orchestrator provider restriction. |
+| `/auto primary clear` / `/auto primary providers clear` | Clear the parent/orchestrator provider restriction and restore the unrestricted candidate menu. |
+| `/auto orchestrator ...` | Exact alias for the `/auto primary ...` command family. |
 | `--auto` | Enable routing for the current session (in addition to the persisted toggle). |
 
 ## State
@@ -295,7 +382,8 @@ null ⇒ no exact parent lock; otherwise the parent session is held to that exac
 `provider/id` while routing is active. `allowlist` (empty ⇒ all) limits routing
 targets to specific `provider/id` entries. `orchestratorAllowedProviders`
 (empty ⇒ all) limits only the parent/orchestrator provider menu; it does not
-modify subagent child pins. `matrixEnabled` (default true since #353/ADR-0079)
+modify subagent child policy or explicit third-party pins. `matrixEnabled`
+(default true since #353/ADR-0079)
 gates matrix routing. `load()` merges the persisted file over the defaults, so
 a state file lacking a newer field gets the current default, while an explicitly
 persisted `false` (a real `/auto matrix off`) always survives.
@@ -304,23 +392,28 @@ persisted `false` (a real `/auto matrix off`) always survives.
 
 | File | Role |
 |---|---|
+| `MATRIX_LIFECYCLE_V1.md` | Maintained policy/status/review schema, generation/hash, command side-effect, standalone-path, and validation contract. |
 | `index.ts` | Factory: wires `before_agent_start`, `/auto`, `--auto`, the `🤖 provider/id` status-bar segment (`ctx.ui.setStatus` on `model_select` + `session_start`), `session_start` state restore, and the `message_end` task-type recorder join. |
 | `argv-guard.ts` | `hasExplicitModelFlag()` — the explicit `--model` precedence check (#519, ADR-0076). |
 | `policy.ts` | Candidate menu + classifier prompt; resolve/validate the choice; pick the classifier model; `resolveByTaskType` — the deterministic matrix pick (#352). |
 | `classifier.ts` | The `complete()` side-call + JSON parse; graceful `null` on any failure. |
 | `route.ts` | Dispatch logic (structurally typed, unit-tested); returns a `RouteOutcome`. |
+| `matrix-status.ts` | Stable v1 matrix/snapshot/coverage status payload plus human and JSON formatters. |
+| `matrix-runtime.ts` | Explicit refresh orchestration: clear memory caches, optionally retry session-unavailable models, reload policy, and build a new generation. |
+| `matrix-review.ts` | Pure deterministic facts/observations/proposals report with canonical evidence hashing and human/JSON formatters; no filesystem or policy-write access. |
 | `../shared/copilot-discovery.ts` | Live GitHub Copilot `/models` discovery — filters the menu to genuinely-usable copilot models (ADR-0035). In `shared/` since #536 (the subagent spawn gate reuses it); auto-router remains the session_start cache-clearer alongside subagent's own. |
-| `anthropic-discovery.ts` | Live Anthropic `/v1/models` discovery — drops retired registry ids that 404 when routed (#538). |
+| `../shared/availability-snapshot.ts` | ADR-0104 canonical, immutable registry + Copilot/Anthropic/oMLX evidence shared with subagent policy; stable hash and process-local generation. |
+| `../shared/anthropic-discovery.ts` | Live Anthropic `/v1/models` discovery — drops retired registry ids that 404 when routed (#538); moved to shared for parent/child parity. |
 | `../shared/omlx-discovery.ts` | Live oMLX `/v1/models` probe — drops the local candidate when the server is confirmed down or the model unloaded (#364). In `shared/` since #534 (the subagent spawn gate reuses it for liveness gating, ADR-0081); auto-router still clears its cache on `session_start`. |
 | `recorder.ts` | #351 measurement pipeline: join a routed turn's task-type label with its real usage → `task-types.jsonl`. |
 | `state.ts` | Persisted toggle/config (incl. `matrixEnabled`) + in-memory decision cache (`{target, taskType, source}` per prompt hash). |
-| `types.ts` | `RouterModel` (= `complete()`'s model param), `Auth`, the closed `TASK_TYPES` taxonomy, and `PickSource` (#352). |
+| `types.ts` | `RouterModel` (= `complete()`'s model param), `Auth`, `PickSource`, and the `TASK_TYPES` alias sourced from `shared/task-types.ts`. |
 
 ## Copilot live availability (ADR-0035, #343)
 
-pi's `getAvailable()` reflects a **static** catalog filtered by credential, so it over-reports `github-copilot` models the subscription cannot serve (tier-gated or picker-disabled) — which then 400 when routed (e.g. `github-copilot/gpt-5.4-nano`). Before building the menu, `shared/copilot-discovery.ts` (relocated in #536) queries the live Copilot `/models` endpoint (auth + base both derived from the JWT pi already manages via `getApiKeyAndHeaders`) and keeps only `model_picker_enabled === true && policy.state !== "disabled"` models; copilot candidates absent from that set are dropped. Non-copilot providers are untouched.
+pi's `getAvailable()` reflects a **static** catalog filtered by credential, so it over-reports `github-copilot` models the subscription cannot serve (tier-gated or picker-disabled) — which then 400 when routed (e.g. `github-copilot/gpt-5.4-nano`). While building the canonical snapshot, `shared/copilot-discovery.ts` (relocated in #536) queries the live Copilot `/models` endpoint (auth + base both derived from the JWT pi already manages via `getApiKeyAndHeaders`) and keeps only `model_picker_enabled === true && policy.state !== "disabled"` models; copilot candidates absent from that set are dropped. Non-copilot providers are untouched.
 
-**Fail-open:** any failure — no JWT, network error, non-2xx, malformed/empty body — leaves the static menu unchanged (routing never breaks). The result is cached per session (~20 min, model-ids only, never the JWT; host-pinned + no off-host redirect). When the live filter legitimately empties an all-Copilot menu, the `copilot-filtered` outcome explains it ("gated by your subscription tier — use /model") instead of the misleading "no credentialed models."
+**Fail-open:** any failure — no JWT, network error, non-2xx, malformed/empty body, or the five-second discovery deadline — leaves the static menu unchanged (routing never breaks). Discovery caches model ids for 20 minutes only, never the JWT; cache epochs reject stale in-flight writes after a clear. ADR-0104 then freezes the evidence in the shared session snapshot until session start or an explicit refresh clears it. When the live filter legitimately empties an all-Copilot menu, the `copilot-filtered` outcome explains it ("gated by your subscription tier — use /model") instead of the misleading "no credentialed models."
 
 ## Anthropic live availability (#538)
 
@@ -329,7 +422,7 @@ The third instance of the live-discovery pattern: pi's static registry keeps
 configured they enter `getAvailable()` — the classifier then routes real turns
 to models the API 404s (observed live: every simple-qa prompt on an
 Anthropic-credentialed host picked the retired cheapest entry and failed).
-Before building the menu, `anthropic-discovery.ts` queries the live
+Before building the canonical snapshot, `shared/anthropic-discovery.ts` queries the live
 `GET /v1/models` endpoint (paginated; auth reuses whatever pi manages via
 `getApiKeyAndHeaders` — `x-api-key` for API keys, `Bearer` + oauth beta header
 for `sk-ant-oat…` tokens) and drops anthropic candidates absent from the
@@ -337,21 +430,23 @@ result. Non-anthropic providers are untouched.
 
 **Fail-open (Copilot semantics, not the oMLX authoritative-empty):** any
 failure — no credential, an auth grant `/v1/models` rejects, non-2xx,
-malformed/oversized/empty body, network error — leaves the static menu
-unchanged. Cached per session (~20 min, model-id strings only, never the
-credential; host-pinned to `api.anthropic.com`, HTTPS-only, no off-host
-redirect), cleared each `session_start`.
+malformed/oversized/empty body, network error, or the five-second discovery
+deadline — leaves the static menu unchanged. Discovery caches model-id strings
+for 20 minutes only, never the credential; cache epochs reject stale in-flight
+writes after a clear. ADR-0104 freezes that evidence in the shared session snapshot.
+Host-pinned to `api.anthropic.com`, HTTPS-only, no off-host redirect.
 
 ## oMLX live availability (#364)
 
 The local-server analog of the Copilot filter: pi treats the registered omlx
 model (#518) as available whenever its `!cat` apiKey is *configured* — the
 command is never executed by the availability check — so a stopped server or
-an unloaded model still looks routable. Before building the menu,
+an unloaded model still looks routable. While building the canonical snapshot,
 `shared/omlx-discovery.ts` (relocated in #534) probes `GET /v1/models` on the loopback base
 (`OMLX_BASE_URL` override honored, non-loopback refused; bearer read at
 request time from `OMLX_API_KEY` or `~/.omlx/api-key`, never stored or
-logged; 60s TTL cache of model-id strings only, cleared each `session_start`).
+logged; 60s TTL cache of model-id strings only). ADR-0104 freezes the
+resulting evidence in the shared session snapshot.
 
 Filtering happens **only on confirmed evidence**: a connection-level failure
 (server down — the one case where, unlike the Copilot filter, an *empty* set
@@ -361,7 +456,7 @@ the model's alias (not loaded). Everything ambiguous fails open — timeouts
 much alive), 401/5xx (the probe's key handling must never kill a candidate
 pi's own request-time resolution might serve), malformed bodies. Non-omlx
 candidates are never touched, and all filters (allowlist, Copilot, Anthropic,
-oMLX) compose AND-wise.
+oMLX) compose AND-wise in ADR-0104's session-frozen snapshot.
 
 ## Deferred (post-v1)
 

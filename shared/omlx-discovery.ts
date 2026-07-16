@@ -127,12 +127,14 @@ function isAbortLike(err: unknown): boolean {
  * for the null-vs-empty-set contract. Pure given injected deps.
  */
 export async function fetchServedOmlxModels(deps: OmlxDiscoveryDeps = {}): Promise<Set<string> | null> {
+  if (deps.signal?.aborted) return null;
   const fetchFn = deps.fetchFn ?? (globalThis.fetch as unknown as FetchLike | undefined);
   if (!fetchFn) return null;
   const base = omlxBaseUrl(deps.baseUrl, deps.configuredBaseUrl);
   if (!base) return null;
 
   const key = await (deps.readKey ?? readOmlxKey)();
+  if (deps.signal?.aborted) return null;
   const timeout = AbortSignal.timeout(PROBE_TIMEOUT_MS);
   const signal = deps.signal ? AbortSignal.any([deps.signal, timeout]) : timeout;
 
@@ -164,10 +166,12 @@ export async function fetchServedOmlxModels(deps: OmlxDiscoveryDeps = {}): Promi
 // tests/sessions that change from localhost to a configured provider endpoint
 // never reuse a stale result from the wrong server.
 let cache: { base: string; models: Set<string>; expiresAt: number } | undefined;
+let cacheEpoch = 0;
 
-/** Clear the discovery cache (called on session_start; used in tests). */
+/** Clear the discovery cache and invalidate every older in-flight write. */
 export function clearOmlxCache(): void {
   cache = undefined;
+  cacheEpoch += 1;
 }
 
 /** Cached wrapper around {@link fetchServedOmlxModels} (60s TTL; null uncached). */
@@ -176,8 +180,11 @@ export async function getServedOmlxModels(deps: OmlxDiscoveryDeps = {}): Promise
   const base = omlxBaseUrl(deps.baseUrl, deps.configuredBaseUrl);
   if (!base) return null;
   if (cache && cache.base === base && now < cache.expiresAt) return cache.models;
+  const epoch = ++cacheEpoch;
   const models = await fetchServedOmlxModels({ ...deps, baseUrl: base, configuredBaseUrl: undefined });
-  if (models !== null) cache = { base, models, expiresAt: now + CACHE_TTL_MS };
+  if (models !== null && epoch === cacheEpoch) {
+    cache = { base, models, expiresAt: now + CACHE_TTL_MS };
+  }
   return models;
 }
 

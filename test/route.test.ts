@@ -1,17 +1,25 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { beforeEach, test } from "node:test";
 
+import { clearAvailabilitySnapshot } from "../shared/availability-snapshot.ts";
+import { clearAnthropicCache } from "../shared/anthropic-discovery.ts";
 import type { RegistryModel } from "../shared/candidates.ts";
 import type { RoutingMatrix } from "../shared/routing-matrix.ts";
 import type { CompleteFn } from "../classifier.ts";
 import { clearCopilotCache, type FetchLike } from "../shared/copilot-discovery.ts";
 import { clearOmlxCache } from "../shared/omlx-discovery.ts";
-import { clearAnthropicCache } from "../anthropic-discovery.ts";
 import { route, type RouteContext, type RoutePi } from "../route.ts";
 import { DecisionCache, type RouterState } from "../state.ts";
 import type { Auth, RouterModel } from "../types.ts";
 
 const CFG: RouterState = { enabled: true, classifierModel: null, orchestratorModelLock: null, allowlist: [], orchestratorAllowedProviders: [], matrixEnabled: false };
+
+beforeEach(() => {
+  clearAvailabilitySnapshot();
+  clearCopilotCache();
+  clearAnthropicCache();
+  clearOmlxCache();
+});
 const CFG_MATRIX: RouterState = { ...CFG, matrixEnabled: true };
 
 function mkModel(provider: string, id: string): RouterModel {
@@ -333,6 +341,29 @@ test("fails open: a /models error leaves the static menu (nano stays routable)",
   });
   assert.deepEqual(out, { kind: "routed", target: "github-copilot/gpt-5.4-nano", cached: false, source: "classifier", taskType: "unknown", reason: "x" });
   clearCopilotCache();
+});
+
+test("drops a retired Anthropic model through the shared availability snapshot", async () => {
+  const available = [
+    { provider: "anthropic", id: "served", contextWindow: 200_000, cost: { input: 2, output: 10, cacheRead: 0, cacheWrite: 0 } },
+    { provider: "anthropic", id: "retired", contextWindow: 200_000, cost: { input: 0.1, output: 0.5, cacheRead: 0, cacheWrite: 0 } },
+  ];
+  const servedOnly: FetchLike = async () => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({ data: [{ id: "served" }], has_more: false, last_id: null }),
+  });
+  const out = await route(
+    makePi(),
+    makeCtx({ available }),
+    "hi",
+    CFG,
+    null,
+    new DecisionCache(),
+    new Set(),
+    { completeFn: completeReturning('{"model":"anthropic/retired"}'), fetchFn: servedOnly },
+  );
+  assert.deepEqual(out, { kind: "unresolved", choice: "anthropic/retired" });
 });
 
 // --- #352: deterministic capability-matrix override -------------------------

@@ -214,7 +214,10 @@ export function orderClassifierModels(
   preferOmlx = true,
 ): Candidate[] {
   const byCost = [...candidates].sort(
-    (a, b) => a.cost.input - b.cost.input || a.contextWindow - b.contextWindow,
+    (a, b) =>
+      a.cost.input - b.cost.input ||
+      a.contextWindow - b.contextWindow ||
+      `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`),
   );
   if (configured) {
     const pinned = byCost.find((c) => `${c.provider}/${c.id}` === configured);
