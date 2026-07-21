@@ -1,7 +1,7 @@
 /**
  * auto-router/classifier.ts — the cheap-model side-call that picks a model.
  *
- * Uses pi-ai `complete()` (verified against pi v0.80.2 examples
+ * Uses pi-ai `complete()` (verified against pi v0.80.10-psmfd.1 examples
  * `examples/extensions/qna.ts`, `summarize.ts`, `handoff.ts`,
  * `custom-compaction.ts` — NOT `streamSimple`, which is a provider
  * implementation hook; see ADR-0031). Imported from

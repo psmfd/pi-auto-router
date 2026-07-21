@@ -10,19 +10,21 @@
  */
 
 import type { Candidate } from "./candidates.ts";
+import { LOCAL_PROVIDERS } from "./local-role.ts";
 import type { MatrixTier, RoutingMatrix } from "./routing-matrix.ts";
 import { THRESHOLDS, type NormalizedUsage } from "./signals.ts";
 
 /** The output weight in the matrix cost-rank scalar `input + k·output`. */
 export const COST_RANK_K = 1;
 
-/** Default local provider ids. Strict provider equality; no prefix matching. */
-export const DEFAULT_LOCAL_PROVIDERS = ["omlx"] as const;
-
 export interface RankOptions {
   /** Whether local candidates form the first ranking lane. Defaults to true. */
   readonly preferLocal?: boolean | undefined;
-  /** Provider ids treated as local. Defaults to `omlx`. */
+  /**
+   * Provider ids treated as local. Defaults to local-role.ts's
+   * LOCAL_PROVIDERS — the single "what counts as local" list, so eligibility
+   * filtering (filterLocalCandidates) and ranking cannot drift (#788).
+   */
   readonly localProviders?: readonly string[] | undefined;
 }
 
@@ -32,7 +34,7 @@ export function costRank(c: Candidate): number {
 }
 
 function localProviderSet(options: RankOptions): ReadonlySet<string> {
-  return new Set(options.localProviders ?? DEFAULT_LOCAL_PROVIDERS);
+  return new Set(options.localProviders ?? LOCAL_PROVIDERS);
 }
 
 /** True when a candidate belongs to a configured local provider lane. */

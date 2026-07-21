@@ -7,7 +7,7 @@
  * falls back to the current model. `/auto [on|off|status]` and `--auto` control
  * it; state persists across sessions via shared/state.
  *
- * Verified against pi v0.80.6-psmfd.1: event lifecycle, `pi.setModel`,
+ * Verified against pi v0.80.10-psmfd.1 (the agent/vendor/pi pin): event lifecycle, `pi.setModel`,
  * `ctx.modelRegistry.{getAvailable,getApiKeyAndHeaders,find}`, and pi-ai
  * `complete()`. See ADR-0031.
  */
@@ -25,6 +25,7 @@ import {
   type AvailabilitySnapshotContext,
 } from "./shared/availability-snapshot.ts";
 import { clearAnthropicCache } from "./shared/anthropic-discovery.ts";
+import { publishTaskType } from "./shared/phase-state.ts";
 import { DEFAULT_LOCAL_ROLE, isLocalModelKey, readLocalRole, type LocalRole } from "./shared/local-role.ts";
 import {
   loadRoutingMatrixResult,
@@ -168,15 +169,14 @@ function splitModelKey(value: string): { provider: string; id: string } {
  */
 async function readPreferLocalOmlxSetting(): Promise<boolean> {
   try {
-    const p = path.join(os.homedir(), ".pi", "agent", "settings.json");
-    const j = JSON.parse(await fs.promises.readFile(p, "utf8")) as {
-      extensionSettings?: { autoRouter?: { preferLocalOmlx?: unknown } };
-    };
+    const j = await readUserSettings();
     const v = j?.extensionSettings?.autoRouter?.preferLocalOmlx;
     // Strict boolean only — reject truthy strings/numbers so accidental
     // `"true"` or `1` cannot silently pass. Default to true on any mismatch.
     return typeof v === "boolean" ? v : true;
   } catch {
+    // readUserSettings rethrows non-ENOENT errors; this lever stays
+    // fail-open to the local-first default regardless.
     return true;
   }
 }
@@ -703,6 +703,9 @@ export default function autoRouter(pi: ExtensionAPI): void {
             ctx.ui.notify("auto-router: unknown primary providers action", "warning");
             return;
           }
+        } else if (sub !== "status") {
+          ctx.ui.notify("auto-router: unknown primary action", "warning");
+          return;
         }
         ctx.ui.notify(
           `auto-router: primary providers=${formatProviders(cfg.orchestratorAllowedProviders)}; ` +
@@ -824,6 +827,21 @@ export default function autoRouter(pi: ExtensionAPI): void {
         outcome.kind === "routed"
           ? { taskType: outcome.taskType, source: outcome.source }
           : null;
+      // Phase signal (#677, ADR-0109): publish the label to the shared
+      // in-memory phase store so the compaction when-policy can detect
+      // task-type boundaries. Best-effort; never disturbs routing.
+      if (outcome.kind === "routed") {
+        try {
+          const sid = (
+            ctx as unknown as {
+              sessionManager?: { getSessionId?: () => string };
+            }
+          )?.sessionManager?.getSessionId?.();
+          if (sid) publishTaskType(sid, outcome.taskType);
+        } catch {
+          // observational only
+        }
+      }
       feedback(ctx, outcome);
     } catch {
       applyingRouteModelChange = false;

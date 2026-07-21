@@ -72,10 +72,13 @@ export function parseLocalRole(value: unknown): LocalRole {
  * default. Callers read once per session (auto-router) or once per tool call
  * (subagent) — changes apply on the next session/call, same posture as
  * preferLocalOmlx.
+ *
+ * `agentDir` overrides the `~/.pi/agent` directory for tests only (same
+ * injection seam as state.ts); production callers pass nothing.
  */
-export async function readLocalRole(): Promise<LocalRole> {
+export async function readLocalRole(agentDir?: string): Promise<LocalRole> {
   try {
-    const p = path.join(os.homedir(), ".pi", "agent", "settings.json");
+    const p = path.join(agentDir ?? path.join(os.homedir(), ".pi", "agent"), "settings.json");
     const j = JSON.parse(await fs.readFile(p, "utf8")) as {
       extensionSettings?: { localLlm?: { role?: unknown } };
     };

@@ -25,6 +25,50 @@ Try it first without installing: `pi -e git:github.com/psmfd/pi-auto-router`.
 
 **Routing never blocks a turn.** Any failure — no candidates, no credential, parse error, network error, abort, `setModel` returning `false`, or a hallucinated model not in the menu — falls back to the current model.
 
+```mermaid
+flowchart TD
+  subgraph PiRuntime["pi runtime (lifecycle events)"]
+    SessionStart["session_start"]
+    BeforeAgentStart["before_agent_start"]
+    ModelSelect["model_select"]
+    MessageEnd["message_end"]
+    AutoCmd["/auto command + --auto flag"]
+  end
+
+  subgraph AutoRouter["auto-router (index.ts)"]
+    Init["session init: load state + matrix, clear caches, read settings"]
+    LockApply["orchestrator lock apply"]
+    RouteDispatch["route() dispatch"]
+    Feedback["feedback(): status bar + toast"]
+    Recorder["message_end join (recorder.ts)"]
+    PublishPhase["publishTaskType()"]
+  end
+
+  subgraph External["providers, filesystem, other extensions"]
+    ClassifierCall["complete() side-call to classifier provider"]
+    PhaseStore["shared/phase-state.ts (in-memory session store)"]
+    Compaction["compaction-optimizer when-policy"]
+    Subagent["subagent extension (shares frozen snapshot)"]
+    TaskLog["task-types.jsonl"]
+  end
+
+  SessionStart --> Init
+  AutoCmd --> LockApply
+  BeforeAgentStart --> LockApply
+  BeforeAgentStart --> RouteDispatch
+  RouteDispatch -->|"cheapest-first, fail over on provider error"| ClassifierCall
+  ClassifierCall -->|"choice JSON or provider error"| RouteDispatch
+  RouteDispatch --> Feedback
+  LockApply --> Feedback
+  RouteDispatch --> PublishPhase
+  PublishPhase --> PhaseStore
+  PhaseStore --> Compaction
+  ModelSelect --> Feedback
+  MessageEnd --> Recorder
+  Recorder --> TaskLog
+  RouteDispatch -.->|"reads shared frozen snapshot generation"| Subagent
+```
+
 ### Feedback
 
 - **Status bar** (persistent): `🤖 provider/id` shows the model currently in use, refreshed after every routing attempt and on every model change (router `set`, manual `/model`, `Ctrl+P` cycle, session restore), seeded at `session_start`.
@@ -35,6 +79,50 @@ Try it first without installing: `pi -e git:github.com/psmfd/pi-auto-router`.
 The classifier call can fail — most commonly a **429 quota/rate error** from the provider. The router treats any provider error as "this model is unavailable", **fails over to the next candidate** (cheapest-first) until one returns a choice or the list is exhausted, and records the dead `provider/id` in a **session unavailable set**. That set is excluded from both the classifier rotation and the routing menu (so the real turn isn't sent to a quota-dead model either), and is **cleared at `session_start`** so a recovered quota gets a fresh chance.
 
 When the cause is specifically a **429 / quota / rate-limit**, the message says so plainly instead of a generic "no choice": `all N candidate model(s) are rate-limited / quota-exhausted (429). Routing paused — use /model to pick a model, or wait for the quota to reset.` Once models are marked unavailable, subsequent prompts hit `no-candidates` (`all-unavailable`) and skip the classifier calls entirely — no further quota burn. Note the classifier and the turn share the same quota, so an exhausted provider fails the real turn too; that turn-level error is pi's, not the router's. The lasting fix for a single shared-quota provider is a genuinely separate model (e.g. a free local model, `track:local-llm`).
+
+## Routing decision flow
+
+The complete `before_agent_start` ladder — gates, lock precedence, fallbacks,
+and the matrix override:
+
+```mermaid
+flowchart TD
+  Start(["before_agent_start fires"]) --> D1{"routing enabled? cfg.enabled OR --auto"}
+  D1 -- no --> NoOp1["no-op: clear pendingLabel, leave model untouched"]
+  D1 -- yes --> D2{"explicit --model on argv? (argv-guard)"}
+  D2 -- yes --> Inert["routing inert for whole process; one-time notify"]
+  D2 -- no --> D3{"orchestratorModelLock set?"}
+
+  D3 -- no --> D4["route(): build or reuse session-frozen availability snapshot"]
+  D3 -- yes --> D3a{"lock target local AND localRole != full?"}
+  D3a -- "yes — bypassed" --> D3aNotify["notify once: lock bypassed by lever; fall through to routing"]
+  D3aNotify --> D4
+  D3a -- no --> D3b{"locked model in registry?"}
+  D3b -- no --> LockMissing["kept current; warn not available"]
+  D3b -- yes --> LockApply["setModelEphemeral(locked); skip classifier"]
+
+  D4 --> D5{"any credentialed candidates?"}
+  D5 -- no --> NoCand["no-candidates (none-credentialed / all-unavailable / copilot-filtered)"]
+  D5 -- yes --> D6{"two-pool local-role filter: target pool empty?"}
+  D6 -- yes --> LocalRestricted["no-candidates (local-restricted)"]
+  D6 -- no --> D7["orderClassifierModels: pinned, then cost/window, then local-first"]
+
+  D7 --> D8{"classifier loop: any candidate returns a valid choice?"}
+  D8 -- no --> ClassifyFailed["classify-failed (429-aware message)"]
+  D8 -- yes --> D9{"choice in target pool and still available?"}
+  D9 -- no --> Unresolved["unresolved (hallucinated or went unavailable)"]
+  D9 -- yes --> D10{"matrixEnabled AND matrix loaded?"}
+
+  D10 -- no --> SourceClassifier["target = classifier choice (source: classifier)"]
+  D10 -- yes --> D10a{"resolveByTaskType pick found and revalidated?"}
+  D10a -- no --> SourceClassifier
+  D10a -- yes --> SourceMatrix["target = matrix pick (source: matrix)"]
+
+  SourceClassifier --> D11{"setModelEphemeral(target) ok?"}
+  SourceMatrix --> D11
+  D11 -- no --> NoCredential["no-credential; kept current"]
+  D11 -- yes --> Routed["routed: decision cached, taskType label armed, publishTaskType() best-effort"]
+```
 
 ## Task-type measurement (#351)
 
@@ -73,6 +161,15 @@ written before #352 lack the `source` field and default to `classifier`. This
 observed data seeded the Phase 2 routing matrix, and the `source` split is what
 keeps it honestly re-evaluable now that #352 consults it (a dataset that can't
 separate matrix-forced from organic choices would be self-confirming).
+
+### Cross-extension phase signal (ADR-0109, #677)
+
+On every **routed** outcome, index.ts publishes the task-type label into
+`shared/phase-state.ts` (`publishTaskType(sessionId, taskType)`) — an
+in-memory, session-keyed store the compaction-optimizer when-policy reads to
+detect task-type boundaries (a fresh boundary is a preferred compaction
+point). The publish is best-effort and wrapped in try/catch: it never blocks
+or disturbs routing, and a missing session id simply skips the signal.
 
 ### Local workhorse in the rotation (#363, ADR-0084)
 
@@ -240,7 +337,7 @@ Detail arrays are capped at 100 entries with explicit omitted counts, and
 retained rationale display is capped at 500 characters; full inputs still
 participate in the evidence hashes.
 
-Pi v0.80.6 exposes no documented extension API that reloads only the static
+Pi v0.80.10-psmfd.1 exposes no documented extension API that reloads only the static
 model registry. If `~/.pi/agent/models.json` changed, open `/model` first (Pi
 reloads that file when the picker opens), then run `/auto matrix refresh`.
 
@@ -275,6 +372,12 @@ The standalone `pi-auto-router` mirror ships this command and its inlined
 5. A human edits the matrix and lands it through a reviewed PR. Run the package
    tests before merge. No review or refresh command applies the change.
 
+## Routing controls and precedence
+
+Session-level controls that govern the parent `pi.setModel()` path regardless
+of whether matrix routing is enabled (they were historically documented under
+Matrix routing; none is matrix-specific):
+
 ### Primary/orchestrator provider restriction (#552, ADR-0083)
 
 Operators who want the parent/orchestrator session to stay on a provider tier
@@ -299,8 +402,9 @@ candidates instead of falling through to local.
 This split is intentionally scoped to auto-router's parent-session
 `pi.setModel()` path. Subagent children independently consume the same frozen
 availability snapshot and capability matrix. Thirteen first-party wrappers
-request local eligibility with `local-llm: true`; the review trio requests
-`capability-tier: frontier`; and local-forbidden wrappers (including `bash`
+request local eligibility with `local-llm: true`; `code-review-expert` and
+`security-review-expert` request `capability-tier: frontier` (`linter`
+carries no tier); and local-forbidden wrappers (including `bash`
 tool surfaces) remove local candidates before matrix selection. No first-party
 wrapper currently carries an exact `model:` pin. Explicit third-party pins
 remain authoritative and still pass through the spawn-time liveness/fallback
@@ -401,6 +505,7 @@ persisted `false` (a real `/auto matrix off`) always survives.
 | `matrix-status.ts` | Stable v1 matrix/snapshot/coverage status payload plus human and JSON formatters. |
 | `matrix-runtime.ts` | Explicit refresh orchestration: clear memory caches, optionally retry session-unavailable models, reload policy, and build a new generation. |
 | `matrix-review.ts` | Pure deterministic facts/observations/proposals report with canonical evidence hashing and human/JSON formatters; no filesystem or policy-write access. |
+| `ephemeral-set-model.ts` | `setModelEphemeral()` (#533, ADR-0096): monkey-patches `SettingsManager.prototype.setDefaultModelAndProvider` to a no-op for the duration of each routed/lock `pi.setModel()` call, so routing never rewrites the persisted global default. **Fail-open** on upstream shape drift (falls back to plain `setModel`, which persists); a microtask-scale race window where a concurrent manual persist would be suppressed is accepted and documented in the module. Retires when upstream ships a persist opt-out (earendil-works/pi#5263). |
 | `../shared/copilot-discovery.ts` | Live GitHub Copilot `/models` discovery — filters the menu to genuinely-usable copilot models (ADR-0035). In `shared/` since #536 (the subagent spawn gate reuses it); auto-router remains the session_start cache-clearer alongside subagent's own. |
 | `../shared/availability-snapshot.ts` | ADR-0104 canonical, immutable registry + Copilot/Anthropic/oMLX evidence shared with subagent policy; stable hash and process-local generation. |
 | `../shared/anthropic-discovery.ts` | Live Anthropic `/v1/models` discovery — drops retired registry ids that 404 when routed (#538); moved to shared for parent/child parity. |
@@ -409,13 +514,95 @@ persisted `false` (a real `/auto matrix off`) always survives.
 | `state.ts` | Persisted toggle/config (incl. `matrixEnabled`) + in-memory decision cache (`{target, taskType, source}` per prompt hash). |
 | `types.ts` | `RouterModel` (= `complete()`'s model param), `Auth`, `PickSource`, and the `TASK_TYPES` alias sourced from `shared/task-types.ts`. |
 
-## Copilot live availability (ADR-0035, #343)
+### Shared foundation
+
+The table above details the four discovery/snapshot modules; auto-router's
+full direct `../shared/` import surface is **13 modules** — `candidates`,
+`signals`, `notify`, `state`, `routing-matrix` (+ `routing-matrix.json`),
+`task-types`, `model-ranking`, `availability-snapshot`, `copilot-discovery`,
+`anthropic-discovery`, `omlx-discovery`, `local-role`, and `phase-state` —
+matching the standalone mirror's inline closure in `mirror/targets.yml`
+(ADR-0065; `cost.ts` rides along transitively via `candidates`). Per-module
+purpose and contracts live in [shared/README.md](https://github.com/psmfd/pi-config/blob/main/agent/extensions/shared/README.md).
+
+```mermaid
+flowchart LR
+  subgraph Core["auto-router core"]
+    IndexTS["index.ts"]
+    RouteTS["route.ts"]
+    PolicyTS["policy.ts"]
+    ClassifierTS["classifier.ts"]
+    MatrixTS["matrix-status / matrix-runtime / matrix-review"]
+    RecorderTS["recorder.ts"]
+    StateTS["state.ts"]
+    TypesTS["types.ts"]
+    ArgvGuardTS["argv-guard.ts"]
+    EphemeralTS["ephemeral-set-model.ts"]
+  end
+
+  subgraph Shared["shared/ (13-module inline closure, ADR-0065)"]
+    Candidates["candidates.ts"]
+    RoutingMatrixMod["routing-matrix.ts + .json"]
+    ModelRanking["model-ranking.ts"]
+    AvailSnap["availability-snapshot.ts (ADR-0104)"]
+    Discovery["copilot / anthropic / omlx discovery"]
+    LocalRole["local-role.ts (ADR-0094)"]
+    PhaseState["phase-state.ts (ADR-0109)"]
+    SharedState["state.ts / signals.ts / notify.ts / task-types.ts"]
+  end
+
+  subgraph PiApi["pinned pi API (v0.80.10-psmfd.1)"]
+    ExtAPI["ExtensionAPI: registerCommand/registerFlag/setModel"]
+    PiAiCompat["pi-ai complete()"]
+    SettingsProto["SettingsManager.prototype (patched)"]
+  end
+
+  subgraph Disk["on-disk artifacts"]
+    StateJson["state.json"]
+    TaskTypesJsonl["task-types.jsonl"]
+    UserSettings["~/.pi/agent/settings.json (USER layer)"]
+  end
+
+  subgraph OtherExt["other extensions"]
+    SubagentExt["subagent (snapshot + local-role + matrix)"]
+    CompactionExt["compaction-optimizer (phase-state)"]
+  end
+
+  IndexTS --> RouteTS & RecorderTS & StateTS & MatrixTS & ArgvGuardTS & EphemeralTS
+  IndexTS --> AvailSnap & Discovery & LocalRole & PhaseState & RoutingMatrixMod
+  RouteTS --> PolicyTS & ClassifierTS & AvailSnap & LocalRole & EphemeralTS
+  PolicyTS --> Candidates & ModelRanking & RoutingMatrixMod & LocalRole
+  ClassifierTS --> PiAiCompat
+  StateTS --> SharedState
+  TypesTS --> SharedState
+  ModelRanking --> LocalRole
+  EphemeralTS --> SettingsProto
+  IndexTS --> ExtAPI
+  StateTS --> StateJson
+  RecorderTS --> TaskTypesJsonl
+  IndexTS --> UserSettings
+  AvailSnap -.-> SubagentExt
+  PhaseState -.-> CompactionExt
+```
+
+## Canonical availability snapshot (ADR-0104)
+
+The three live-availability layers below do not act independently: while
+building the session's canonical snapshot, `shared/availability-snapshot.ts`
+reads the credentialed registry **once**, composes the Copilot, Anthropic, and
+oMLX evidence over that exact observation, canonically sorts and SHA-256
+hashes the result, and freezes the generation for the session. Both
+auto-router's parent-session routing and subagent policy consume the same
+frozen generation, so a mid-session availability flap cannot desynchronize
+them; `/auto matrix refresh` is the explicit rebuild lever.
+
+### Copilot live availability (ADR-0035, #343)
 
 pi's `getAvailable()` reflects a **static** catalog filtered by credential, so it over-reports `github-copilot` models the subscription cannot serve (tier-gated or picker-disabled) — which then 400 when routed (e.g. `github-copilot/gpt-5.4-nano`). While building the canonical snapshot, `shared/copilot-discovery.ts` (relocated in #536) queries the live Copilot `/models` endpoint (auth + base both derived from the JWT pi already manages via `getApiKeyAndHeaders`) and keeps only `model_picker_enabled === true && policy.state !== "disabled"` models; copilot candidates absent from that set are dropped. Non-copilot providers are untouched.
 
 **Fail-open:** any failure — no JWT, network error, non-2xx, malformed/empty body, or the five-second discovery deadline — leaves the static menu unchanged (routing never breaks). Discovery caches model ids for 20 minutes only, never the JWT; cache epochs reject stale in-flight writes after a clear. ADR-0104 then freezes the evidence in the shared session snapshot until session start or an explicit refresh clears it. When the live filter legitimately empties an all-Copilot menu, the `copilot-filtered` outcome explains it ("gated by your subscription tier — use /model") instead of the misleading "no credentialed models."
 
-## Anthropic live availability (#538)
+### Anthropic live availability (#538)
 
 The third instance of the live-discovery pattern: pi's static registry keeps
 **retired** Anthropic ids (e.g. `claude-3-haiku-20240307`), and with auth
@@ -436,7 +623,7 @@ for 20 minutes only, never the credential; cache epochs reject stale in-flight
 writes after a clear. ADR-0104 freezes that evidence in the shared session snapshot.
 Host-pinned to `api.anthropic.com`, HTTPS-only, no off-host redirect.
 
-## oMLX live availability (#364)
+### oMLX live availability (#364)
 
 The local-server analog of the Copilot filter: pi treats the registered omlx
 model (#518) as available whenever its `!cat` apiKey is *configured* — the
@@ -469,7 +656,7 @@ One extra cheap-model round-trip per *novel* prompt (cached prompts cost nothing
 
 ## API provenance
 
-Verified against **pi v0.80.2** (#573; originally validated against pi v0.79.0 in Phase 0 #328 and re-verified across the SDK bump): event lifecycle (`before_agent_start` → … → `before_provider_request`), `pi.setModel`/`registerCommand`/`registerFlag`, `ctx.modelRegistry.{getAvailable,getApiKeyAndHeaders,find}`, `model_select`, and pi-ai `complete()` (`examples/extensions/qna.ts`, `summarize.ts`, `handoff.ts`, `custom-compaction.ts`).
+Verified against **pi v0.80.10-psmfd.1** — the `agent/vendor/pi` pin (#791; originally validated against pi v0.79.0 in Phase 0 #328, re-verified at v0.80.2 in #573 and against the current pin in the #791 review): event lifecycle (`before_agent_start` → … → `before_provider_request`), `pi.setModel`/`registerCommand`/`registerFlag`, `ctx.modelRegistry.{getAvailable,getApiKeyAndHeaders,find}`, `model_select`, and pi-ai `complete()` (`examples/extensions/qna.ts`, `summarize.ts`, `handoff.ts`, `custom-compaction.ts`).
 
 > **Note on pi-ai imports.** pi 0.80.x moved the request/response API (`complete`, `completeSimple`, `stream`, `getModel`, `getModels`, `getProviders`, `registerApiProvider`, `getEnvApiKey`, …) off the `@earendil-works/pi-ai` root entrypoint to `@earendil-works/pi-ai/compat`. Runtime is unaffected (the extension loader aliases root → compat as a strict superset), but source that typechecks against the published `.d.ts` must import from `/compat`. The compat entrypoint is officially supported; upstream has stated it will be removed in a future release with a migration guide — tracked as #577.
 

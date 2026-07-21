@@ -122,16 +122,15 @@ export function buildMatrixStatusPayload(input: MatrixStatusInput): MatrixStatus
             staleAfterDays: load.matrix.staleAfterDays ?? 180,
             freshnessAt: load.matrix.refresh?.at ?? load.matrix.lastReviewed,
             freshnessSource: load.matrix.refresh ? "refresh" : "review",
-            freshnessAgeDays: ageDays(
-              load.matrix.refresh?.at ?? load.matrix.lastReviewed,
-              input.now ?? new Date(),
-            ),
-            stale: (() => {
+            ...(() => {
               const age = ageDays(
                 load.matrix.refresh?.at ?? load.matrix.lastReviewed,
                 input.now ?? new Date(),
               );
-              return age === null ? null : age > (load.matrix.staleAfterDays ?? 180);
+              return {
+                freshnessAgeDays: age,
+                stale: age === null ? null : age > (load.matrix.staleAfterDays ?? 180),
+              };
             })(),
             refresh: load.matrix.refresh ? { ...load.matrix.refresh } : null,
             diagnostics: load.diagnostics.map((d) => ({ ...d })),

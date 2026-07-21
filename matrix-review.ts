@@ -4,10 +4,11 @@ import type {
   AvailabilitySnapshot,
   ProviderAvailabilityEvidence,
 } from "./shared/availability-snapshot.ts";
-import type {
-  MatrixLoadResult,
-  MatrixTier,
-  RefreshMetadata,
+import {
+  gardenMatrix,
+  type MatrixLoadResult,
+  type MatrixTier,
+  type RefreshMetadata,
 } from "./shared/routing-matrix.ts";
 
 export interface MatrixReviewInput {
@@ -345,9 +346,12 @@ export function buildMatrixReviewPayload(input: MatrixReviewInput): MatrixReview
   const inertRows = input.snapshot
     ? matrixKeys.filter((key) => !registryProviders.has(providerOf(key)))
     : [];
-  const danglingRows = input.snapshot
-    ? matrixKeys.filter((key) => registryProviders.has(providerOf(key)) && !registrySet.has(key))
-    : [];
+  // Same predicate as matrix-status.ts's coverage report — one shared
+  // implementation so the two reports cannot drift (#791).
+  const danglingRows =
+    input.snapshot && matrix
+      ? [...gardenMatrix(matrix, registrySet).danglingRows].sort(compareText)
+      : [];
   const filteredRows = input.snapshot
     ? matrixKeys.filter((key) => registrySet.has(key) && !liveSet.has(key))
     : [];

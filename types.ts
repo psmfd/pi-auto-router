@@ -7,7 +7,7 @@
  * because pi 0.80.x moved the request/response API off the root entrypoint
  * (#573; runtime loader aliases root→compat as a strict superset, so this is
  * a typecheck-only concern). `Auth` mirrors the shape returned by
- * `ctx.modelRegistry.getApiKeyAndHeaders()` (verified against pi v0.80.2
+ * `ctx.modelRegistry.getApiKeyAndHeaders()` (verified against pi v0.80.10-psmfd.1
  * examples).
  */
 
