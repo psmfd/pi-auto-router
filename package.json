@@ -19,13 +19,13 @@
     "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "0.80.3"
+    "@earendil-works/pi-ai": "0.81.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.75"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.80.3",
+    "@earendil-works/pi-coding-agent": "0.81.1",
     "@types/node": "^25.9.3",
     "tsx": "^4.19.2",
     "typescript": "^6.0.3"
