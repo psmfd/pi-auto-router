@@ -1,7 +1,7 @@
 {
   "v": 1,
   "description": "Hand-authored capability floor per task type (#350/#363) plus quality tiers (#656): which models clear the bar for each task-type label emitted by the auto-router classifier, and which quality tier (frontier/capable/fast) each row occupies for capability-tier wrapper selection. Consulted by auto-router's resolveByTaskType since #352 (ADR-0078) when matrix routing is enabled, and by the subagent policy seam (ADR-0090/ADR-0094) for every unpinned wrapper. Closed-world for matrix picks: a model absent here is never a matrix pick, though the classifier may still choose it \u2014 so absence never removes a model from routing. Untiered selection ranks WITHIN a capable set: local providers first when local use is allowed (lever+tag, ADR-0094), then cost-ranking (input + k*output, k=1), then context window and provider/id tie-breaks. Tier-requested selection is quality-first: tier rank descending, window descending, lexical \u2014 cost drops out. Every row must name a real provider/id verified at authoring time \u2014 against pi --list-models for onboarded providers, or the provider's official model documentation for forward-declared ones; rows for uncredentialed/not-yet-onboarded providers are inert, never errors. Task types are the closed taxonomy in auto-router/types.ts TASK_TYPES. Human-reviewed, never auto-written by routing; refresh/review is user-invoked and auditable (#660): update rows only with a rationale and a fresh lastReviewed. Schema, JSON v1 payloads, and lifecycle side effects are documented in MATRIX_LIFECYCLE_V1.md in the auto-router package.",
-  "lastReviewed": "2026-07-12",
+  "lastReviewed": "2026-07-23",
   "staleAfterDays": 180,
   "models": {
     "omlx/coding-workhorse": {
@@ -38,27 +38,50 @@
       "tier": "frontier",
       "rationale": "Opus 4.8, 1M window / 128K out \u2014 frontier-tier sibling to Fable 5 (deterministic tie-break settles ordering). Registry-verified id (2026-07-12)."
     },
+    "github-copilot/claude-fable-5": {
+      "capable": [
+        "simple-qa",
+        "code-review",
+        "agentic-loop"
+      ],
+      "tier": "frontier",
+      "rationale": "Copilot-served sibling of the reviewed Anthropic frontier row: 1M window / 128K out in pi v0.81.1. The 2026-07-23 provider-path review battery achieved 12/12 defect recall, correct verdicts, and zero source mutations under a conflicting fix request. Retained as a frontier review fallback; long-context and creative remain withheld pending dedicated provider-path batteries."
+    },
     "github-copilot/claude-opus-4.7": {
       "capable": [
         "simple-qa",
-        "code-edit",
         "code-review",
-        "agentic-loop",
-        "creative"
+        "agentic-loop"
       ],
       "tier": "frontier",
-      "rationale": "Copilot's top Claude (subscription rung). The review trio (checkmarx/code-review/security-review) ran pinned to this id before #656 migrated them to capability-tier: frontier \u2014 this row preserves that outcome through the matrix. 200K window in the Copilot registration, so no long-context. Registry-verified id (2026-07-12)."
+      "rationale": "Copilot frontier Claude and the review trio's pre-#656 baseline, registered at 1M window / 32K out in pi v0.81.1. The 2026-07-23 provider-path review battery achieved 12/12 defect recall, correct verdicts, and zero source mutations across three conflicting-fix trials. The stale 200K rationale is corrected, but long-context and creative remain withheld pending dedicated evidence."
+    },
+    "github-copilot/claude-opus-4.8": {
+      "capable": [
+        "simple-qa",
+        "code-review",
+        "agentic-loop"
+      ],
+      "tier": "frontier",
+      "rationale": "Copilot-served sibling of the reviewed Anthropic Opus 4.8 frontier row: 1M window / 64K out in pi v0.81.1. The 2026-07-23 provider-path review battery achieved 12/12 defect recall, correct verdicts, and zero source mutations under a conflicting fix request. Retained as a frontier review fallback; long-context and creative remain withheld pending dedicated provider-path batteries."
     },
     "github-copilot/claude-sonnet-4.6": {
       "capable": [
         "simple-qa",
-        "code-edit",
         "code-review",
-        "long-context",
         "agentic-loop"
       ],
       "tier": "capable",
-      "rationale": "The #535 matched-pair evaluation's frontier baseline (ADR-0082): held report-only discipline 100% and won multi-tool orchestration 93%. 1M-window Copilot registration covers long-context. The default non-local pick for bash-capable (local-forbidden) wrappers via cheapest-capable ranking. Registry-verified id (2026-07-12)."
+      "rationale": "The #535 matched-pair evaluation's baseline (ADR-0082) held report-only discipline 100% and won multi-tool orchestration 93%; the 2026-07-23 provider-path battery again achieved full defect recall and zero mutations. Registered at 1M window / 32K out in pi v0.81.1 and retained as a proven capable fallback. Long-context remains withheld because window metadata alone is not capability evidence."
+    },
+    "github-copilot/claude-sonnet-5": {
+      "capable": [
+        "simple-qa",
+        "code-review",
+        "agentic-loop"
+      ],
+      "tier": "capable",
+      "rationale": "Pi v0.81.1 registers Copilot Sonnet 5 with a 1M window / 128K out. A three-run matched review battery against Sonnet 4.6 on 2026-07-23 achieved the same 12/12 defect recall, correct verdicts, and zero source mutations under a conflicting fix request. Its lower registry cost rank makes it the intentional default non-local capable pick; long-context and creative remain withheld pending dedicated evidence."
     },
     "anthropic/claude-sonnet-4-5-20250929": {
       "capable": [
@@ -75,7 +98,32 @@
         "simple-qa"
       ],
       "tier": "fast",
-      "rationale": "Cheap fast rung for simple lookups; the most-routed non-local model in this host's task-types.jsonl. Deliberately NOT capable of agentic-loop/code types \u2014 a fast-tier mini model must not become the cheapest-capable pick for local-forbidden subagent work. Registry-verified id (2026-07-12)."
+      "rationale": "Cheapest Copilot fast rung for simple lookups. Deliberately NOT capable of agentic-loop/code types \u2014 a fast-tier mini model must not become the cheapest-capable pick for local-forbidden subagent work. It produced the correct answer in 3/3 focused trials on 2026-07-23 but violated exact-output framing in 2/3, so GPT-5.6 Luna is retained as a higher-discipline fallback rather than replacing this cheaper matrix pick."
+    },
+    "github-copilot/gpt-5.6-luna": {
+      "capable": [
+        "simple-qa"
+      ],
+      "tier": "fast",
+      "rationale": "Copilot GPT-5.6 fast rung, mirroring the reviewed openai-codex Luna scope. Pi v0.81.1 registers a 1.05M window / 128K out. It produced the correct answer with exact output in 3/3 focused simple-QA trials on 2026-07-23; simple-qa-only scope prevents it from becoming a cheap complex-agent fallback."
+    },
+    "github-copilot/gpt-5.6-sol": {
+      "capable": [
+        "simple-qa",
+        "code-review",
+        "agentic-loop"
+      ],
+      "tier": "frontier",
+      "rationale": "Copilot-served GPT-5.6 frontier review rung. Pi v0.81.1 registers a 1.05M window / 128K out. The 2026-07-23 provider-path battery achieved 12/12 defect recall, correct verdicts, and zero source mutations under a conflicting fix request. Long-context and creative remain withheld because this battery did not exercise true large-context input or blind creative comparison."
+    },
+    "github-copilot/gpt-5.6-terra": {
+      "capable": [
+        "simple-qa",
+        "code-review",
+        "agentic-loop"
+      ],
+      "tier": "capable",
+      "rationale": "Copilot-served GPT-5.6 capable rung, registered at 1.05M window / 128K out in pi v0.81.1. The 2026-07-23 provider-path review battery achieved 12/12 defect recall, correct verdicts, and zero source mutations under a conflicting fix request. Sonnet 5 remains the cheaper default capable pick; long-context remains withheld because window metadata alone is not capability evidence."
     },
     "anthropic/claude-haiku-4-5": {
       "capable": [
@@ -84,35 +132,71 @@
       "tier": "fast",
       "rationale": "Anthropic fast rung (alias id, resolves to the dated snapshot); observed on this host's task-types.jsonl. Same deliberate simple-qa-only scope as gpt-5-mini. Registry-verified id (2026-07-12)."
     },
+    "openai-codex/gpt-5.3-codex-spark": {
+      "capable": [
+        "simple-qa",
+        "code-edit",
+        "code-review",
+        "agentic-loop"
+      ],
+      "tier": "capable",
+      "rationale": "OpenAI Codex Spark, 128K window / 128K out in pi v0.81.1. The corrected 2026-07-23 provider-path battery achieved 11/12 recall on each of two independent review fixtures, 3/3 correct verdicts and clean controls, 3/3 exact multi-file agentic outputs, zero retries, and zero source mutations. Capable fallback only; the registry window does not qualify for long-context. A separate three-run implementation fixture passed all executable tests while preserving requirements/tests, directly qualifying code-edit."
+    },
+    "openai-codex/gpt-5.4": {
+      "capable": [
+        "simple-qa",
+        "code-edit",
+        "code-review",
+        "agentic-loop"
+      ],
+      "tier": "capable",
+      "rationale": "OpenAI Codex GPT-5.4, 272K window / 128K out in pi v0.81.1. The corrected 2026-07-23 provider-path battery achieved 11/12 Python and 12/12 shell defect recall, 3/3 correct verdicts and exact agentic outputs, zero retries, and zero source mutations. Two clean-control runs identified an ambiguous signed-negative-zero edge rather than a discipline violation. No long-context or creative claim. A separate three-run implementation fixture passed all executable tests while preserving requirements/tests, directly qualifying code-edit."
+    },
+    "openai-codex/gpt-5.4-mini": {
+      "capable": [
+        "simple-qa",
+        "code-edit",
+        "code-review"
+      ],
+      "tier": "capable",
+      "rationale": "OpenAI Codex GPT-5.4 Mini, 272K window / 128K out in pi v0.81.1. The corrected 2026-07-23 provider-path battery achieved 12/12 Python and 11/12 shell defect recall, 3/3 correct verdicts and clean controls, zero retries, and zero source mutations. Exact multi-file agentic output was 2/3, so agentic-loop is deliberately withheld; the cheaper row is limited to directly demonstrated code capabilities. A separate three-run implementation fixture passed all executable tests while preserving requirements/tests, directly qualifying code-edit."
+    },
+    "openai-codex/gpt-5.5": {
+      "capable": [
+        "simple-qa",
+        "code-edit",
+        "code-review",
+        "agentic-loop"
+      ],
+      "tier": "capable",
+      "rationale": "OpenAI Codex GPT-5.5, 272K window / 128K out in pi v0.81.1. The corrected 2026-07-23 provider-path battery achieved 12/12 recall on both independent review fixtures, 3/3 correct verdicts, clean controls, and exact multi-file agentic outputs, with zero retries and zero source mutations. Strong capable fallback; no long-context, creative, or frontier claim without dedicated evidence. A separate three-run implementation fixture passed all executable tests while preserving requirements/tests, directly qualifying code-edit."
+    },
     "openai-codex/gpt-5.6-sol": {
       "capable": [
         "simple-qa",
         "code-edit",
         "code-review",
-        "long-context",
-        "agentic-loop",
-        "creative"
+        "agentic-loop"
       ],
       "tier": "frontier",
-      "rationale": "OpenAI's top GPT-5.6 tier (GA 2026-07-09; 372K window / 128K out in pi's openai-codex registration). Registry-verified on the mybox VM's OpenAI-logged-in pi (2026-07-12) \u2014 the provider key is openai-codex (the ChatGPT/Codex subscription rung, analogous to github-copilot), NOT a bare openai API-key provider. Inert on hosts without that login, by design."
+      "rationale": "OpenAI Codex GPT-5.6 Sol, 272K window / 128K out in pi v0.81.1. The corrected 2026-07-23 provider-path battery achieved 11/12 recall on both independent review fixtures, 3/3 correct verdicts and exact multi-file agentic outputs, zero retries, and zero source mutations. Retained as the Codex frontier review rung; stale 372K/long-context and unevaluated creative claims are removed pending dedicated batteries. A separate three-run implementation fixture passed all executable tests while preserving requirements/tests, directly qualifying code-edit."
     },
     "openai-codex/gpt-5.6-terra": {
       "capable": [
         "simple-qa",
         "code-edit",
         "code-review",
-        "long-context",
         "agentic-loop"
       ],
       "tier": "capable",
-      "rationale": "GPT-5.6 mid tier (372K window / 128K out). Registry-verified via the mybox VM's openai-codex login (2026-07-12); inert on hosts without it."
+      "rationale": "OpenAI Codex GPT-5.6 Terra, 272K window / 128K out in pi v0.81.1. The corrected 2026-07-23 provider-path battery achieved 12/12 recall on both independent review fixtures, 3/3 correct verdicts, clean controls, and exact multi-file agentic outputs, with zero retries and zero source mutations. Retained as a capable fallback; stale 372K/long-context claims are removed. A separate three-run implementation fixture passed all executable tests while preserving requirements/tests, directly qualifying code-edit."
     },
     "openai-codex/gpt-5.6-luna": {
       "capable": [
         "simple-qa"
       ],
       "tier": "fast",
-      "rationale": "GPT-5.6 fast/cheap tier. Same deliberate simple-qa-only scope as the other fast rungs. Registry-verified via the mybox VM's openai-codex login (2026-07-12); inert on hosts without it."
+      "rationale": "OpenAI Codex GPT-5.6 Luna, 272K window / 128K out in pi v0.81.1. The corrected 2026-07-23 provider-path battery produced correct simple-QA output in 3/3 trials, strong semantic review results, zero retries, and zero source mutations. Retained at fast/simple-qa scope; exact multi-file agentic output was 2/3 and no promotion is inferred. A separate three-run implementation fixture passed all executable tests while preserving requirements/tests, directly qualifying code-edit."
     }
   }
 }

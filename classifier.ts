@@ -19,6 +19,7 @@
 
 import { complete, type UserMessage } from "@earendil-works/pi-ai/compat";
 
+import { isProviderRateLimited } from "./shared/session-unavailable.ts";
 import type { RoutingPrompt } from "./policy.ts";
 import { toTaskType, type Auth, type RouterModel, type TaskType } from "./types.ts";
 
@@ -44,12 +45,6 @@ export type ClassifyResult =
   | { readonly status: "no-credential" }
   | { readonly status: "unavailable"; readonly detail: "rate-limited" | "error" }
   | { readonly status: "bad-response" };
-
-/** Does a thrown provider error look like a 429 / quota / rate-limit? */
-export function isRateLimited(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /\b429\b|quota|rate[\s-]?limit|too many requests/i.test(msg);
-}
 
 /** The subset of `complete`'s signature the classifier depends on (injectable for tests). */
 export type CompleteFn = (
@@ -115,7 +110,7 @@ export async function classify(
   } catch (err) {
     // Provider error — try a different model. Tag rate-limit/quota so the UI can
     // say "you're out of quota" rather than a generic failure.
-    return { status: "unavailable", detail: isRateLimited(err) ? "rate-limited" : "error" };
+    return { status: "unavailable", detail: isProviderRateLimited(err) ? "rate-limited" : "error" };
   }
   if (response.stopReason === "aborted") return { status: "bad-response" };
 

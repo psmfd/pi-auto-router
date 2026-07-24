@@ -32,6 +32,10 @@ import {
   type MatrixLoadResult,
   type RoutingMatrix,
 } from "./shared/routing-matrix.ts";
+import {
+  clearSessionUnavailable,
+  sessionUnavailableModels,
+} from "./shared/session-unavailable.ts";
 import { hasExplicitModelFlag } from "./argv-guard.ts";
 import { clearCopilotCache } from "./shared/copilot-discovery.ts";
 import { setModelEphemeral } from "./ephemeral-set-model.ts";
@@ -230,9 +234,9 @@ export default function autoRouter(pi: ExtensionAPI): void {
   // null when missing/malformed (matrix routing degrades to classifier picks).
   let matrix: RoutingMatrix | null = null;
   let matrixLoad: MatrixLoadResult | null = null;
-  // `provider/id`s that returned a provider error (e.g. 429) this session — skipped
-  // as both classifier and routing targets until the next session.
-  const unavailable = new Set<string>();
+  // Canonical process-local provider deny state shared with subagent runtime
+  // failover. Skipped as classifier, routing, and child-policy targets.
+  const unavailable = sessionUnavailableModels;
   // #351 measurement pipeline: the routed prompt's task-type label (plus the
   // #352 matrix/classifier source), STICKY across every assistant
   // `message_end` until the next routing attempt — an agentic turn produces
@@ -273,7 +277,7 @@ export default function autoRouter(pi: ExtensionAPI): void {
     cfg = await state.load();
     matrixLoad = await loadRoutingMatrixResult(); // per-session reload: edits apply next session (#352)
     matrix = matrixLoad.matrix;
-    unavailable.clear(); // give quota-recovered models a fresh chance each session
+    clearSessionUnavailable(); // give quota-recovered models a fresh chance each session
     // ADR-0094 review fix: routing decisions cache the resolved TARGET, and a
     // cache hit bypasses the two-pool lever filtering in buildRoutingPrompt —
     // a decision cached under a permissive lever must not replay after the

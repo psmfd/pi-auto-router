@@ -76,9 +76,9 @@ flowchart TD
 
 ### Resilience (classifier failover)
 
-The classifier call can fail — most commonly a **429 quota/rate error** from the provider. The router treats any provider error as "this model is unavailable", **fails over to the next candidate** (cheapest-first) until one returns a choice or the list is exhausted, and records the dead `provider/id` in a **session unavailable set**. That set is excluded from both the classifier rotation and the routing menu (so the real turn isn't sent to a quota-dead model either), and is **cleared at `session_start`** so a recovered quota gets a fresh chance.
+The classifier call can fail — most commonly a **429 quota/rate error** from the provider. The router treats any provider error as "this model is unavailable", **fails over to the next candidate** (cheapest-first) until one returns a choice or the list is exhausted, and records the dead `provider/id` in the **shared session-unavailable set** (`shared/session-unavailable.ts`, ADR-0122). That set is excluded from classifier rotation, the parent routing menu, and subagent matrix policy. It is **cleared at `session_start`** so recovered quota gets a fresh chance.
 
-When the cause is specifically a **429 / quota / rate-limit**, the message says so plainly instead of a generic "no choice": `all N candidate model(s) are rate-limited / quota-exhausted (429). Routing paused — use /model to pick a model, or wait for the quota to reset.` Once models are marked unavailable, subsequent prompts hit `no-candidates` (`all-unavailable`) and skip the classifier calls entirely — no further quota burn. Note the classifier and the turn share the same quota, so an exhausted provider fails the real turn too; that turn-level error is pi's, not the router's. The lasting fix for a single shared-quota provider is a genuinely separate model (e.g. a free local model, `track:local-llm`).
+When the cause is specifically a **429 / quota / rate-limit**, the message says so plainly instead of a generic "no choice": `all N candidate model(s) are rate-limited / quota-exhausted (429). Routing paused — use /model to pick a model, or wait for the quota to reset.` Once models are marked unavailable, subsequent prompts hit `no-candidates` (`all-unavailable`) and skip classifier calls entirely — no further quota burn. A normal parent turn is still not replayed after a provider error. An unpinned policy-selected **subagent** has a narrower ADR-0122 exception: it may retry once on the next eligible matrix model only when its structured 429 arrives before any tool-execution event. Explicit pins, session-default children, and post-tool failures never replay.
 
 ## Routing decision flow
 
@@ -337,7 +337,7 @@ Detail arrays are capped at 100 entries with explicit omitted counts, and
 retained rationale display is capped at 500 characters; full inputs still
 participate in the evidence hashes.
 
-Pi v0.80.10-psmfd.1 exposes no documented extension API that reloads only the static
+Pi v0.81.1-psmfd.1 exposes no documented extension API that reloads only the static
 model registry. If `~/.pi/agent/models.json` changed, open `/model` first (Pi
 reloads that file when the picker opens), then run `/auto matrix refresh`.
 
@@ -409,7 +409,11 @@ tool surfaces) remove local candidates before matrix selection. No first-party
 wrapper currently carries an exact `model:` pin. Explicit third-party pins
 remain authoritative and still pass through the spawn-time liveness/fallback
 gate. A local-forbidden child with no non-local matrix pick fails closed rather
-than inheriting the parent primary or a possibly-local session default.
+than inheriting the parent primary or a possibly-local session default. If a
+policy-selected child later reports a structured 429 before any tool event,
+ADR-0122 adds that exact model to the shared session deny set and permits one
+reselection against the same snapshot/matrix generation. Result telemetry names
+the failed and effective fallback models; any tool edge refuses replay.
 
 ### Lock the orchestrator model while auto-router is active (ADR-0090)
 
@@ -551,7 +555,7 @@ flowchart LR
     SharedState["state.ts / signals.ts / notify.ts / task-types.ts"]
   end
 
-  subgraph PiApi["pinned pi API (v0.80.10-psmfd.1)"]
+  subgraph PiApi["pinned pi API (v0.81.1-psmfd.1)"]
     ExtAPI["ExtensionAPI: registerCommand/registerFlag/setModel"]
     PiAiCompat["pi-ai complete()"]
     SettingsProto["SettingsManager.prototype (patched)"]
@@ -656,7 +660,7 @@ One extra cheap-model round-trip per *novel* prompt (cached prompts cost nothing
 
 ## API provenance
 
-Verified against **pi v0.80.10-psmfd.1** — the `agent/vendor/pi` pin (#791; originally validated against pi v0.79.0 in Phase 0 #328, re-verified at v0.80.2 in #573 and against the current pin in the #791 review): event lifecycle (`before_agent_start` → … → `before_provider_request`), `pi.setModel`/`registerCommand`/`registerFlag`, `ctx.modelRegistry.{getAvailable,getApiKeyAndHeaders,find}`, `model_select`, and pi-ai `complete()` (`examples/extensions/qna.ts`, `summarize.ts`, `handoff.ts`, `custom-compaction.ts`).
+Verified against **pi v0.81.1-psmfd.1** — the installed `agent/vendor/pi` pin (originally validated against pi v0.79.0 in Phase 0 #328, re-verified at v0.80.2 in #573, v0.80.10 in #791, and v0.81.1 during the 2026-07-23 Copilot matrix refresh): event lifecycle (`before_agent_start` → … → `before_provider_request`), `pi.setModel`/`registerCommand`/`registerFlag`, `ctx.modelRegistry.{getAvailable,getApiKeyAndHeaders,find}`, `model_select`, and pi-ai `complete()` (`examples/extensions/qna.ts`, `summarize.ts`, `handoff.ts`, `custom-compaction.ts`).
 
 > **Note on pi-ai imports.** pi 0.80.x moved the request/response API (`complete`, `completeSimple`, `stream`, `getModel`, `getModels`, `getProviders`, `registerApiProvider`, `getEnvApiKey`, …) off the `@earendil-works/pi-ai` root entrypoint to `@earendil-works/pi-ai/compat`. Runtime is unaffected (the extension loader aliases root → compat as a strict superset), but source that typechecks against the published `.d.ts` must import from `/compat`. The compat entrypoint is officially supported; upstream has stated it will be removed in a future release with a migration guide — tracked as #577.
 

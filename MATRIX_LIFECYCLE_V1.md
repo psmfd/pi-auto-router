@@ -67,7 +67,7 @@ Freshness uses `refresh.at` when present, otherwise `lastReviewed`.
 | `/auto matrix refresh [--retry-unavailable]` | Explicitly clears provider/snapshot/decision caches, reloads policy, and builds one replacement generation. Like first status, provider discovery may resolve configured credentials (including operator-defined `!command` resolvers). | Memory-only. Preserves session-unavailable models unless `--retry-unavailable` is supplied. Never writes policy. |
 | `/auto matrix on` / `/auto matrix off` | Does not clear/replace evidence; the returned status may build the first snapshot. | Persists only the router's matrix-enabled setting and clears decision cache. |
 
-Pi v0.80.6 has no documented extension API for a registry-only reload. After
+Pi v0.81.1 has no documented extension API for a registry-only reload. After
 editing `models.json`, open `/model` first, then run `/auto matrix refresh`.
 Restarting the session also clears the process-local generation.
 
@@ -82,8 +82,9 @@ filter evidence for parent and subagent policy.
   and live candidates. It excludes creation time and generation, so equivalent
   evidence has the same hash.
 - `createdAt` is audit display metadata, not part of the hash.
-- Session-unavailable models (for example a routed 429) are a separate dynamic
-  deny set and never mutate the snapshot or matrix.
+- Session-unavailable models (for example a classifier provider error or an
+  ADR-0122 subagent runtime 429) are one shared dynamic deny set and never
+  mutate the snapshot or matrix.
 
 ## Status JSON v1
 

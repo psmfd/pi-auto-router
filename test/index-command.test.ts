@@ -7,6 +7,10 @@ import { clearAvailabilitySnapshot } from "../shared/availability-snapshot.ts";
 import { clearAnthropicCache } from "../shared/anthropic-discovery.ts";
 import { clearCopilotCache } from "../shared/copilot-discovery.ts";
 import { clearOmlxCache } from "../shared/omlx-discovery.ts";
+import {
+  clearSessionUnavailable,
+  markSessionUnavailable,
+} from "../shared/session-unavailable.ts";
 import autoRouter, { AUTO_COMMAND_DESCRIPTION } from "../index.ts";
 
 type CommandHandler = (args: string | undefined, ctx: ExtensionContext) => Promise<void>;
@@ -67,6 +71,7 @@ beforeEach(() => {
   clearCopilotCache();
   clearAnthropicCache();
   clearOmlxCache();
+  clearSessionUnavailable();
 });
 
 test("command description matches the supported lifecycle and policy grammar", () => {
@@ -162,6 +167,25 @@ test("matrix review is user-invokable as stable JSON and has no apply mode", asy
   assert.equal(notices.at(-1), "auto-router: use /auto matrix review [--json]");
   await handler("matrix review --json extra", ctx);
   assert.equal(notices.at(-1), "auto-router: use /auto matrix review [--json]");
+});
+
+test("status observes child-written shared deny state and refresh clears it only explicitly", async () => {
+  const { handler, ctx, notices } = harness();
+  markSessionUnavailable("github-copilot/quota-dead");
+
+  await handler("matrix status --json", ctx);
+  let parsed = JSON.parse(notices.at(-1) ?? "") as { policy: { unavailable: string[] } };
+  assert.deepEqual(parsed.policy.unavailable, ["github-copilot/quota-dead"]);
+
+  await handler("matrix refresh", ctx);
+  await handler("matrix status --json", ctx);
+  parsed = JSON.parse(notices.at(-1) ?? "") as { policy: { unavailable: string[] } };
+  assert.deepEqual(parsed.policy.unavailable, ["github-copilot/quota-dead"]);
+
+  await handler("matrix refresh --retry-unavailable", ctx);
+  await handler("matrix status --json", ctx);
+  parsed = JSON.parse(notices.at(-1) ?? "") as { policy: { unavailable: string[] } };
+  assert.deepEqual(parsed.policy.unavailable, []);
 });
 
 test("retry-unavailable is explicit and extra command arguments are refused", async () => {
