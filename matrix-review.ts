@@ -10,12 +10,13 @@ import {
   type MatrixTier,
   type RefreshMetadata,
 } from "./shared/routing-matrix.ts";
+import type { SessionDeny } from "./shared/session-unavailable.ts";
 
 export interface MatrixReviewInput {
   readonly matrixLoad: MatrixLoadResult | null;
   readonly snapshot: AvailabilitySnapshot | null;
   readonly snapshotError?: string;
-  readonly unavailable: ReadonlySet<string>;
+  readonly unavailable: SessionDeny;
 }
 
 export interface MatrixReviewObservation {
@@ -31,6 +32,7 @@ export interface MatrixReviewObservation {
     | "matrix-diagnostic"
     | "matrix-not-loaded"
     | "rationale-gap"
+    | "session-provider-denied"
     | "session-unavailable"
     | "tier-gap"
     | "unlisted-filtered-model"
@@ -110,6 +112,7 @@ export interface MatrixReviewPayload {
     readonly dangling: number | null;
     readonly filtered: number | null;
     readonly sessionUnavailable: number;
+    readonly sessionDeniedProviders: number;
   };
   readonly facts: {
     readonly policyRows: readonly {
@@ -130,6 +133,7 @@ export interface MatrixReviewPayload {
     readonly unlistedLiveModels: readonly string[];
     readonly unlistedFilteredModels: readonly string[];
     readonly sessionUnavailable: readonly string[];
+    readonly sessionDeniedProviders: readonly string[];
     readonly inertRows: readonly string[];
     readonly danglingRows: readonly string[];
     readonly filteredRows: readonly string[];
@@ -149,6 +153,7 @@ export interface MatrixReviewPayload {
       readonly danglingRows: number;
       readonly filteredRows: number;
       readonly sessionUnavailable: number;
+      readonly sessionDeniedProviders: number;
       readonly capabilityGaps: number;
       readonly rationaleGaps: number;
       readonly tierGaps: number;
@@ -338,7 +343,9 @@ export function buildMatrixReviewPayload(input: MatrixReviewInput): MatrixReview
     ? input.snapshot.candidates.map(modelKey).sort(compareText)
     : [];
   const liveSet = new Set(liveModels);
-  const unavailable = [...input.unavailable].sort(compareText);
+  // Both scopes are already key-sorted by the deny state (ADR-0126).
+  const unavailable = input.unavailable.models().map((record) => record.key);
+  const deniedProviders = input.unavailable.providers().map((record) => record.key);
 
   const unlistedModels = matrix ? registryKeys.filter((key) => !matrixSet.has(key)) : [];
   const unlistedLiveModels = unlistedModels.filter((key) => liveSet.has(key));
@@ -434,6 +441,10 @@ export function buildMatrixReviewPayload(input: MatrixReviewInput): MatrixReview
   }
   for (const key of unavailable) {
     observations.push(observation("session-unavailable", key, "session provider error deny state is transient and separate from capability policy"));
+  }
+  for (const key of deniedProviders) {
+    const record = input.unavailable.providerRecord(key);
+    observations.push(observation("session-provider-denied", key, `session provider breaker (${record?.source ?? "unknown"}) excludes every model from this provider; transient and separate from capability policy`));
   }
   for (const key of capabilityGaps) {
     if (!observations.some((item) => item.kind === "capability-gap" && item.key === key)) {
@@ -541,6 +552,7 @@ export function buildMatrixReviewPayload(input: MatrixReviewInput): MatrixReview
         ? { state: "error", code: "snapshot-build-failed" }
         : { state: "not-built" },
     unavailable,
+    deniedProviders,
   };
 
   return {
@@ -561,6 +573,7 @@ export function buildMatrixReviewPayload(input: MatrixReviewInput): MatrixReview
       dangling: matrix && input.snapshot ? danglingRows.length : null,
       filtered: matrix && input.snapshot ? filteredRows.length : null,
       sessionUnavailable: unavailable.length,
+      sessionDeniedProviders: deniedProviders.length,
     },
     facts: {
       policyRows,
@@ -570,6 +583,7 @@ export function buildMatrixReviewPayload(input: MatrixReviewInput): MatrixReview
       unlistedLiveModels: bounded(unlistedLiveModels),
       unlistedFilteredModels: bounded(unlistedFilteredModels),
       sessionUnavailable: bounded(unavailable),
+      sessionDeniedProviders: bounded(deniedProviders),
       inertRows: bounded(inertRows),
       danglingRows: bounded(danglingRows),
       filteredRows: bounded(filteredRows),
@@ -589,6 +603,7 @@ export function buildMatrixReviewPayload(input: MatrixReviewInput): MatrixReview
         danglingRows: omitted(danglingRows),
         filteredRows: omitted(filteredRows),
         sessionUnavailable: omitted(unavailable),
+        sessionDeniedProviders: omitted(deniedProviders),
         capabilityGaps: omitted(capabilityGaps),
         rationaleGaps: omitted(rationaleGaps),
         tierGaps: omitted(tierGaps),
@@ -625,7 +640,7 @@ export function formatMatrixReviewHuman(payload: MatrixReviewPayload): string {
     filterOmittedTotal;
   const lines = [
     `MATRIX REVIEW v${payload.v} evidence=${payload.evidenceHash}`,
-    `FACTS catalog=${count(payload.counts.catalog)} matrix=${count(payload.counts.matrix)} intersection=${count(payload.counts.intersection)} live=${count(payload.counts.live)} unlisted=${count(payload.counts.unlisted)} unlistedLive=${count(payload.counts.unlistedLive)} unlistedFiltered=${count(payload.counts.unlistedFiltered)} inert=${count(payload.counts.inert)} dangling=${count(payload.counts.dangling)} filtered=${count(payload.counts.filtered)} sessionUnavailable=${payload.counts.sessionUnavailable}`,
+    `FACTS catalog=${count(payload.counts.catalog)} matrix=${count(payload.counts.matrix)} intersection=${count(payload.counts.intersection)} live=${count(payload.counts.live)} unlisted=${count(payload.counts.unlisted)} unlistedLive=${count(payload.counts.unlistedLive)} unlistedFiltered=${count(payload.counts.unlistedFiltered)} inert=${count(payload.counts.inert)} dangling=${count(payload.counts.dangling)} filtered=${count(payload.counts.filtered)} sessionUnavailable=${payload.counts.sessionUnavailable} sessionDeniedProviders=${payload.counts.sessionDeniedProviders}`,
     `DETAIL LIMIT max=${MAX_DETAIL_ROWS} omitted=${omittedTotal}`,
     `OBSERVATIONS (${payload.observations.length}/${observationTotal})`,
     ...(payload.observations.length > 0

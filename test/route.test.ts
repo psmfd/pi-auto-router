@@ -8,6 +8,7 @@ import type { RoutingMatrix } from "../shared/routing-matrix.ts";
 import type { CompleteFn } from "../classifier.ts";
 import { clearCopilotCache, type FetchLike } from "../shared/copilot-discovery.ts";
 import { clearOmlxCache } from "../shared/omlx-discovery.ts";
+import { createSessionDeny } from "../shared/session-unavailable.ts";
 import { route, type RouteContext, type RoutePi } from "../route.ts";
 import { DecisionCache, type RouterState } from "../state.ts";
 import type { Auth, RouterModel } from "../types.ts";
@@ -76,7 +77,7 @@ function completeReturning(text: string): CompleteFn {
 
 test("routes to the classifier's chosen credentialed model", async () => {
   const pi = makePi(true);
-  const out = await route(pi, makeCtx(), "big refactor", CFG, null, new DecisionCache(), new Set(), {
+  const out = await route(pi, makeCtx(), "big refactor", CFG, null, new DecisionCache(), createSessionDeny(), {
     completeFn: completeReturning('{"model":"anthropic/opus","reason":"x"}'),
   });
   assert.deepEqual(out, { kind: "routed", target: "anthropic/opus", cached: false, source: "classifier", taskType: "unknown", reason: "x" });
@@ -84,7 +85,7 @@ test("routes to the classifier's chosen credentialed model", async () => {
 });
 
 test("routed outcome carries the classifier's taskType label (#351)", async () => {
-  const out = await route(makePi(true), makeCtx(), "fix the bug", CFG, null, new DecisionCache(), new Set(), {
+  const out = await route(makePi(true), makeCtx(), "fix the bug", CFG, null, new DecisionCache(), createSessionDeny(), {
     completeFn: completeReturning('{"taskType":"code-edit","model":"anthropic/opus","reason":"x"}'),
   });
   assert.deepEqual(out, {
@@ -97,8 +98,8 @@ test("a cache hit retains the taskType from the original classification (#351)",
   const ctx = makeCtx();
   const cache = new DecisionCache();
   const cf = completeReturning('{"taskType":"code-review","model":"anthropic/opus","reason":"r"}');
-  await route(pi, ctx, "review this diff", CFG, null, cache, new Set(), { completeFn: cf });
-  const out = await route(pi, ctx, "review this diff", CFG, null, cache, new Set(), { completeFn: cf });
+  await route(pi, ctx, "review this diff", CFG, null, cache, createSessionDeny(), { completeFn: cf });
+  const out = await route(pi, ctx, "review this diff", CFG, null, cache, createSessionDeny(), { completeFn: cf });
   assert.deepEqual(out, {
     kind: "routed", target: "anthropic/opus", cached: true, source: "classifier", taskType: "code-review",
   });
@@ -108,7 +109,7 @@ test("serves identical prompts from the decision cache without re-classifying", 
   const pi = makePi(true);
   const ctx = makeCtx();
   const cache = new DecisionCache();
-  const unavailable = new Set<string>();
+  const unavailable = createSessionDeny();
   let calls = 0;
   const cf: CompleteFn = async () => {
     calls += 1;
@@ -124,14 +125,14 @@ test("a cached target that went unavailable is re-classified, not reused", async
   const pi = makePi(true);
   const ctx = makeCtx();
   const cache = new DecisionCache();
-  const unavailable = new Set<string>();
+  const unavailable = createSessionDeny();
   // First turn caches anthropic/opus.
   await route(pi, ctx, "p", CFG, null, cache, unavailable, {
     completeFn: completeReturning('{"model":"anthropic/opus","reason":"a"}'),
   });
   // opus 429s out-of-band this session; the same prompt must NOT be served the
   // dead cached opus — it must re-classify (and the menu now excludes opus).
-  unavailable.add("anthropic/opus");
+  unavailable.mark("anthropic/opus", { rateLimited: false });
   const out = await route(pi, ctx, "p", CFG, null, cache, unavailable, {
     completeFn: completeReturning('{"model":"anthropic/haiku","reason":"b"}'),
   });
@@ -141,7 +142,7 @@ test("a cached target that went unavailable is re-classified, not reused", async
 test("skips a classifier candidate absent from the registry and fails over", async () => {
   // haiku (cheapest) is not in the registry as a classifier model → "not-in-registry";
   // the loop fails over to opus, which answers.
-  const out = await route(makePi(true), makeCtx({ findUndefinedFor: "anthropic/haiku" }), "hi", CFG, null, new DecisionCache(), new Set(), {
+  const out = await route(makePi(true), makeCtx({ findUndefinedFor: "anthropic/haiku" }), "hi", CFG, null, new DecisionCache(), createSessionDeny(), {
     completeFn: completeReturning('{"model":"anthropic/opus","reason":"x"}'),
   });
   assert.deepEqual(out, { kind: "routed", target: "anthropic/opus", cached: false, source: "classifier", taskType: "unknown", reason: "x" });
@@ -149,14 +150,14 @@ test("skips a classifier candidate absent from the registry and fails over", asy
 
 test("returns no-registry-model when the resolved target is absent from the registry", async () => {
   // The haiku classifier picks opus, but opus is not findable as a routable model.
-  const out = await route(makePi(), makeCtx({ findUndefinedFor: "anthropic/opus" }), "hi", CFG, null, new DecisionCache(), new Set(), {
+  const out = await route(makePi(), makeCtx({ findUndefinedFor: "anthropic/opus" }), "hi", CFG, null, new DecisionCache(), createSessionDeny(), {
     completeFn: completeReturning('{"model":"anthropic/opus","reason":"x"}'),
   });
   assert.deepEqual(out, { kind: "no-registry-model", target: "anthropic/opus" });
 });
 
 test("returns no-candidates when nothing is credentialed", async () => {
-  const out = await route(makePi(), makeCtx({ available: [] }), "hi", CFG, null, new DecisionCache(), new Set(), {
+  const out = await route(makePi(), makeCtx({ available: [] }), "hi", CFG, null, new DecisionCache(), createSessionDeny(), {
     completeFn: completeReturning("{}"),
   });
   assert.deepEqual(out, { kind: "no-candidates", reason: "none-credentialed" });
@@ -170,7 +171,7 @@ test("primary provider restriction refuses to fall through to local when no allo
     { ...CFG, orchestratorAllowedProviders: ["github-copilot"] },
     null,
     new DecisionCache(),
-    new Set(),
+    createSessionDeny(),
     { completeFn: completeReturning("{}") },
   );
   assert.deepEqual(out, { kind: "provider-restriction-empty", providers: ["github-copilot"] });
@@ -194,7 +195,7 @@ test("primary provider restriction keeps matrix routing from forcing local workh
     { ...CFG_MATRIX, orchestratorAllowedProviders: ["github-copilot"] },
     localMatrix,
     new DecisionCache(),
-    new Set(),
+    createSessionDeny(),
     { completeFn: completeReturning('{"taskType":"code-edit","model":"github-copilot/gpt-5-mini","reason":"x"}') },
   );
   assert.deepEqual(out, {
@@ -221,7 +222,7 @@ test("primary provider restriction composes with the concrete model allowlist", 
     { ...CFG, allowlist: ["github-copilot/gpt-5-mini"], orchestratorAllowedProviders: ["github-copilot"] },
     null,
     new DecisionCache(),
-    new Set(),
+    createSessionDeny(),
     { completeFn: completeReturning('{"model":"github-copilot/gpt-5-mini","reason":"x"}') },
   );
   assert.deepEqual(out, { kind: "routed", target: "github-copilot/gpt-5-mini", cached: false, source: "classifier", taskType: "unknown", reason: "x" });
@@ -229,7 +230,7 @@ test("primary provider restriction composes with the concrete model allowlist", 
 
 test("falls back (no setModel) when every candidate returns no JSON", async () => {
   const pi = makePi();
-  const out = await route(pi, makeCtx(), "hi", CFG, null, new DecisionCache(), new Set(), {
+  const out = await route(pi, makeCtx(), "hi", CFG, null, new DecisionCache(), createSessionDeny(), {
     completeFn: completeReturning("I cannot decide"),
   });
   assert.equal(out.kind, "classify-failed");
@@ -237,7 +238,7 @@ test("falls back (no setModel) when every candidate returns no JSON", async () =
 });
 
 test("returns unresolved when the choice is not a credentialed candidate", async () => {
-  const out = await route(makePi(), makeCtx(), "hi", CFG, null, new DecisionCache(), new Set(), {
+  const out = await route(makePi(), makeCtx(), "hi", CFG, null, new DecisionCache(), createSessionDeny(), {
     completeFn: completeReturning('{"model":"ghost/model"}'),
   });
   assert.deepEqual(out, { kind: "unresolved", choice: "ghost/model" });
@@ -245,14 +246,14 @@ test("returns unresolved when the choice is not a credentialed candidate", async
 
 test("reports no-credential (no throw) when setModel returns false", async () => {
   const pi = makePi(false);
-  const out = await route(pi, makeCtx(), "hi", CFG, null, new DecisionCache(), new Set(), {
+  const out = await route(pi, makeCtx(), "hi", CFG, null, new DecisionCache(), createSessionDeny(), {
     completeFn: completeReturning('{"model":"anthropic/opus"}'),
   });
   assert.deepEqual(out, { kind: "no-credential", target: "anthropic/opus" });
 });
 
 test("falls back when the classifier model has no credential", async () => {
-  const out = await route(makePi(), makeCtx({ auth: { ok: false } }), "hi", CFG, null, new DecisionCache(), new Set(), {
+  const out = await route(makePi(), makeCtx({ auth: { ok: false } }), "hi", CFG, null, new DecisionCache(), createSessionDeny(), {
     completeFn: completeReturning('{"model":"anthropic/opus"}'),
   });
   assert.equal(out.kind, "classify-failed");
@@ -260,7 +261,7 @@ test("falls back when the classifier model has no credential", async () => {
 
 test("fails over to the next classifier model on a provider error (e.g. 429)", async () => {
   const pi = makePi(true);
-  const unavailable = new Set<string>();
+  const unavailable = createSessionDeny();
   // cheapest-first classifier order is haiku, then opus. haiku 429s; opus answers.
   const cf: CompleteFn = async (model) => {
     if (modelId(model) === "haiku") throw new Error("OpenAI API error (429): quota exceeded");
@@ -273,7 +274,7 @@ test("fails over to the next classifier model on a provider error (e.g. 429)", a
 });
 
 test("exhausts the list and marks every unavailable model when all fail over", async () => {
-  const unavailable = new Set<string>();
+  const unavailable = createSessionDeny();
   const cf: CompleteFn = async () => {
     throw new Error("429 quota exceeded");
   };
@@ -290,7 +291,12 @@ test("exhausts the list and marks every unavailable model when all fail over", a
 });
 
 test("excludes already-unavailable models from the menu", async () => {
-  const unavailable = new Set(["anthropic/haiku", "anthropic/opus"]);
+  const unavailable = createSessionDeny();
+  // Seed model-scope denies only: `rateLimited: false` keeps this pre-seed from
+  // tripping the ADR-0126 provider breaker, so the test still exercises the
+  // model-scope exclusion path it was written for.
+  unavailable.mark("anthropic/haiku", { rateLimited: false });
+  unavailable.mark("anthropic/opus", { rateLimited: false });
   const out = await route(makePi(), makeCtx(), "hi", CFG, null, new DecisionCache(), unavailable, {
     completeFn: completeReturning('{"model":"anthropic/opus"}'),
   });
@@ -314,7 +320,7 @@ test("drops a Copilot model the live /models set excludes (the gpt-5.4-nano bug)
   clearCopilotCache();
   // The classifier 'picks' the phantom; with the filter active it is not in the
   // menu, so resolveChoice fails rather than routing the real turn to a 400.
-  const out = await route(makePi(), makeCtx(COPILOT_CTX), "hi", CFG, null, new DecisionCache(), new Set(), {
+  const out = await route(makePi(), makeCtx(COPILOT_CTX), "hi", CFG, null, new DecisionCache(), createSessionDeny(), {
     completeFn: completeReturning('{"model":"github-copilot/gpt-5.4-nano"}'),
     fetchFn: onlyGpt55,
   });
@@ -324,7 +330,7 @@ test("drops a Copilot model the live /models set excludes (the gpt-5.4-nano bug)
 
 test("routes to a Copilot model that IS picker-enabled", async () => {
   clearCopilotCache();
-  const out = await route(makePi(), makeCtx(COPILOT_CTX), "hi", CFG, null, new DecisionCache(), new Set(), {
+  const out = await route(makePi(), makeCtx(COPILOT_CTX), "hi", CFG, null, new DecisionCache(), createSessionDeny(), {
     completeFn: completeReturning('{"model":"github-copilot/gpt-5.5","reason":"ok"}'),
     fetchFn: onlyGpt55,
   });
@@ -335,7 +341,7 @@ test("routes to a Copilot model that IS picker-enabled", async () => {
 test("fails open: a /models error leaves the static menu (nano stays routable)", async () => {
   clearCopilotCache();
   const throwing: FetchLike = async () => { throw new Error("network"); };
-  const out = await route(makePi(), makeCtx(COPILOT_CTX), "hi", CFG, null, new DecisionCache(), new Set(), {
+  const out = await route(makePi(), makeCtx(COPILOT_CTX), "hi", CFG, null, new DecisionCache(), createSessionDeny(), {
     completeFn: completeReturning('{"model":"github-copilot/gpt-5.4-nano","reason":"x"}'),
     fetchFn: throwing,
   });
@@ -360,7 +366,7 @@ test("drops a retired Anthropic model through the shared availability snapshot",
     CFG,
     null,
     new DecisionCache(),
-    new Set(),
+    createSessionDeny(),
     { completeFn: completeReturning('{"model":"anthropic/retired"}'), fetchFn: servedOnly },
   );
   assert.deepEqual(out, { kind: "unresolved", choice: "anthropic/retired" });
@@ -380,28 +386,28 @@ const cfEdit = () =>
 
 test("matrix override picks the cheapest capable model over the classifier's choice", async () => {
   const pi = makePi(true);
-  const out = await route(pi, makeCtx(), "fix it", CFG_MATRIX, MATRIX, new DecisionCache(), new Set(), {
+  const out = await route(pi, makeCtx(), "fix it", CFG_MATRIX, MATRIX, new DecisionCache(), createSessionDeny(), {
     completeFn: cfEdit(),
   });
   assert.deepEqual(out, { kind: "routed", target: "anthropic/haiku", cached: false, source: "matrix", taskType: "code-edit", reason: "x" });
 });
 
 test("matrixEnabled false ignores the matrix entirely (explicit-off regression fence)", async () => {
-  const out = await route(makePi(true), makeCtx(), "fix it", CFG, MATRIX, new DecisionCache(), new Set(), {
+  const out = await route(makePi(true), makeCtx(), "fix it", CFG, MATRIX, new DecisionCache(), createSessionDeny(), {
     completeFn: cfEdit(),
   });
   assert.deepEqual(out, { kind: "routed", target: "anthropic/opus", cached: false, source: "classifier", taskType: "code-edit", reason: "x" });
 });
 
 test("matrix null with the flag on behaves identically to flag off", async () => {
-  const out = await route(makePi(true), makeCtx(), "fix it", CFG_MATRIX, null, new DecisionCache(), new Set(), {
+  const out = await route(makePi(true), makeCtx(), "fix it", CFG_MATRIX, null, new DecisionCache(), createSessionDeny(), {
     completeFn: cfEdit(),
   });
   assert.deepEqual(out, { kind: "routed", target: "anthropic/opus", cached: false, source: "classifier", taskType: "code-edit", reason: "x" });
 });
 
 test("empty capable set falls back to the classifier's pick (never throws)", async () => {
-  const out = await route(makePi(true), makeCtx(), "review it", CFG_MATRIX, MATRIX, new DecisionCache(), new Set(), {
+  const out = await route(makePi(true), makeCtx(), "review it", CFG_MATRIX, MATRIX, new DecisionCache(), createSessionDeny(), {
     completeFn: completeReturning('{"taskType":"code-review","model":"anthropic/opus","reason":"x"}'),
   });
   assert.deepEqual(out, { kind: "routed", target: "anthropic/opus", cached: false, source: "classifier", taskType: "code-review", reason: "x" });
@@ -409,7 +415,7 @@ test("empty capable set falls back to the classifier's pick (never throws)", asy
 
 test("a matrix pick that went unavailable mid-loop is rejected in favor of the classifier's pick", async () => {
   const pi = makePi(true);
-  const unavailable = new Set<string>();
+  const unavailable = createSessionDeny();
   // haiku (the capable matrix pick, and first classifier candidate) 429s while
   // classifying; opus answers. The matrix must not route to quota-dead haiku.
   const cf: CompleteFn = (model) =>
@@ -424,8 +430,8 @@ test("a cache hit replays the matrix-sourced decision without re-picking", async
   const pi = makePi(true);
   const ctx = makeCtx();
   const cache = new DecisionCache();
-  await route(pi, ctx, "fix it", CFG_MATRIX, MATRIX, cache, new Set(), { completeFn: cfEdit() });
-  const out = await route(pi, ctx, "fix it", CFG_MATRIX, MATRIX, cache, new Set(), { completeFn: cfEdit() });
+  await route(pi, ctx, "fix it", CFG_MATRIX, MATRIX, cache, createSessionDeny(), { completeFn: cfEdit() });
+  const out = await route(pi, ctx, "fix it", CFG_MATRIX, MATRIX, cache, createSessionDeny(), { completeFn: cfEdit() });
   assert.deepEqual(out, { kind: "routed", target: "anthropic/haiku", cached: true, source: "matrix", taskType: "code-edit" });
 });
 
@@ -456,7 +462,7 @@ test("a cached local target is not replayed under a restricted lever (ADR-0094 r
     CFG,
     null,
     cache,
-    new Set(),
+    createSessionDeny(),
     { completeFn: completeReturning('{"model":"omlx/coding-workhorse","reason":"cheap"}'), localRole: "full", fetchFn: noNetwork },
   );
   assert.deepEqual(first, {
@@ -472,7 +478,7 @@ test("a cached local target is not replayed under a restricted lever (ADR-0094 r
     CFG,
     null,
     cache,
-    new Set(),
+    createSessionDeny(),
     { completeFn: completeReturning('{"model":"anthropic/haiku","reason":"non-local"}'), localRole: "classifier-only", fetchFn: noNetwork },
   );
   assert.equal(second.kind, "routed");

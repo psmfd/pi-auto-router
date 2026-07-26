@@ -18,6 +18,7 @@ import {
 import { isLocalModelKey, type LocalRole } from "./shared/local-role.ts";
 import type { NotifyContext } from "./shared/notify.ts";
 import type { RoutingMatrix } from "./shared/routing-matrix.ts";
+import type { SessionDeny } from "./shared/session-unavailable.ts";
 import { getUsage } from "./shared/signals.ts";
 import { classify, type ClassifierChoice, type CompleteFn } from "./classifier.ts";
 import { setModelEphemeral } from "./ephemeral-set-model.ts";
@@ -104,7 +105,7 @@ export async function route(
   cfg: RouterState,
   matrix: RoutingMatrix | null,
   cache: DecisionCache,
-  unavailable: Set<string>,
+  unavailable: SessionDeny,
   deps: RouteDeps = {},
 ): Promise<RouteOutcome> {
   const key = hashPrompt(prompt);
@@ -192,7 +193,17 @@ export async function route(
         choice = result.choice;
         break;
       }
-      if (result.status === "unavailable") unavailable.add(id);
+      // ADR-0126: only a conclusively rate-limited probe counts as provider
+      // quota evidence. A generic classifier error (`detail: "error"`) still
+      // denies the exact model but must never push the provider breaker toward
+      // tripping — it says nothing about the account's quota.
+      if (result.status === "unavailable") {
+        unavailable.mark(id, {
+          source: "classifier-probe",
+          reason: result.detail,
+          rateLimited: result.detail === "rate-limited",
+        });
+      }
     }
     if (!choice) return { kind: "classify-failed", attempts };
 

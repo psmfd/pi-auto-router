@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import type { AvailabilitySnapshot } from "../shared/availability-snapshot.ts";
 import type { MatrixLoadResult } from "../shared/routing-matrix.ts";
+import { createSessionDeny, type SessionDeny } from "../shared/session-unavailable.ts";
 import { refreshMatrixRuntime } from "../matrix-runtime.ts";
 
 const LOAD: MatrixLoadResult = {
@@ -31,7 +32,7 @@ const SNAPSHOT = {
   },
 } as const satisfies AvailabilitySnapshot;
 
-function deps(unavailable: Set<string>, calls: string[], snapshot: () => Promise<AvailabilitySnapshot> = () => Promise.resolve(SNAPSHOT)) {
+function deps(unavailable: SessionDeny, calls: string[], snapshot: () => Promise<AvailabilitySnapshot> = () => Promise.resolve(SNAPSHOT)) {
   return {
     loadMatrix: () => {
       calls.push("load-matrix");
@@ -49,7 +50,8 @@ function deps(unavailable: Set<string>, calls: string[], snapshot: () => Promise
 
 test("refresh clears policy/discovery caches but preserves session unavailable by default", async () => {
   const calls: string[] = [];
-  const unavailable = new Set(["p/dead"]);
+  const unavailable = createSessionDeny();
+  unavailable.mark("p/dead", { rateLimited: false });
   const result = await refreshMatrixRuntime(deps(unavailable, calls), false);
   assert.deepEqual(calls, [
     "clear-snapshot",
@@ -59,13 +61,14 @@ test("refresh clears policy/discovery caches but preserves session unavailable b
     "clear-decisions",
     "load-matrix",
   ]);
-  assert.deepEqual([...unavailable], ["p/dead"]);
+  assert.deepEqual(unavailable.models().map((record) => record.key), ["p/dead"]);
   assert.equal(result.snapshot, SNAPSHOT);
   assert.equal(result.retriedUnavailable, false);
 });
 
 test("retry-unavailable explicitly clears the session deny set", async () => {
-  const unavailable = new Set(["p/dead"]);
+  const unavailable = createSessionDeny();
+  unavailable.mark("p/dead", { rateLimited: false });
   const result = await refreshMatrixRuntime(deps(unavailable, []), true);
   assert.equal(unavailable.size, 0);
   assert.equal(result.retriedUnavailable, true);
@@ -73,7 +76,7 @@ test("retry-unavailable explicitly clears the session deny set", async () => {
 
 test("snapshot failure is sanitized without discarding the reloaded matrix", async () => {
   const result = await refreshMatrixRuntime(
-    deps(new Set(), [], () => Promise.reject(new Error("https://token@example.invalid/private"))),
+    deps(createSessionDeny(), [], () => Promise.reject(new Error("https://token@example.invalid/private"))),
     false,
   );
   assert.equal(result.matrixLoad, LOAD);

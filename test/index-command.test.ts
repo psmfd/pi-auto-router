@@ -79,6 +79,7 @@ test("command description matches the supported lifecycle and policy grammar", (
   assert.match(AUTO_COMMAND_DESCRIPTION, /settings \[status\]/);
   assert.match(AUTO_COMMAND_DESCRIPTION, /matrix \[status \[--json\]\|review \[--json\]\|refresh \[--retry-unavailable\]/);
   assert.match(AUTO_COMMAND_DESCRIPTION, /lock \[status\|current\|set provider\/id\|clear\]/);
+  assert.match(AUTO_COMMAND_DESCRIPTION, /providers \[status \[--json\]\|disable provider\|enable provider\|enable --all\]/);
   assert.match(AUTO_COMMAND_DESCRIPTION, /\(primary\|orchestrator\) \[/);
   assert.match(AUTO_COMMAND_DESCRIPTION, /providers \[status\|clear\|set provider\.\.\.\|add provider\.\.\.\|remove provider\.\.\.\]/);
 });
@@ -197,4 +198,171 @@ test("retry-unavailable is explicit and extra command arguments are refused", as
   assert.equal(notices.at(-1), "auto-router: use /auto matrix status [--json]");
   await handler("matrix refresh --retry-unavailable extra", ctx);
   assert.equal(notices.at(-1), "auto-router: use /auto matrix refresh [--retry-unavailable]");
+});
+
+// --- ADR-0126 (#902): provider session circuit breaker ----------------------
+
+interface BreakerStatus {
+  readonly v: 1;
+  readonly kind: string;
+  readonly threshold: number;
+  readonly providers: readonly { key: string; scope: string; source: string; reason: string; at: string }[];
+  readonly models: readonly { key: string; source: string }[];
+  readonly primaryProviders: readonly string[];
+}
+
+const COPILOT: HarnessModel = {
+  provider: "github-copilot",
+  id: "gpt-5",
+  contextWindow: 128_000,
+  cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+};
+
+function breakerStatus(notices: readonly string[]): BreakerStatus {
+  return JSON.parse(notices.at(-1) ?? "") as BreakerStatus;
+}
+
+test("disable removes a provider from the session and status explains the provenance", async () => {
+  const { handler, ctx, notices } = harness([COPILOT]);
+
+  await handler("providers status --json", ctx);
+  assert.deepEqual(breakerStatus(notices).providers, []);
+
+  await handler("providers disable github-copilot", ctx);
+  assert.match(notices.at(-1) ?? "", /disabled provider github-copilot/);
+
+  await handler("providers status --json", ctx);
+  const status = breakerStatus(notices);
+  assert.equal(status.kind, "provider-breaker-status");
+  assert.equal(status.providers.length, 1);
+  const record = status.providers[0];
+  assert.ok(record);
+  assert.equal(record.key, "github-copilot");
+  assert.equal(record.scope, "provider");
+  assert.equal(record.source, "operator");
+  assert.equal(record.reason, "operator disable");
+  assert.match(record.at, /^\d{4}-\d{2}-\d{2}T/);
+  // The parent matrix view must agree with the breaker's own status.
+  await handler("matrix status --json", ctx);
+  const parsed = JSON.parse(notices.at(-1) ?? "") as {
+    policy: { unavailable: string[]; deniedProviders: string[] };
+  };
+  assert.deepEqual(parsed.policy.deniedProviders, ["github-copilot"]);
+  assert.deepEqual(parsed.policy.unavailable, [], "a provider breaker is not a model deny");
+});
+
+test("enable re-admits one provider and enable --all clears every scope", async () => {
+  const { handler, ctx, notices } = harness([COPILOT]);
+  markSessionUnavailable("openai-codex/gpt-5.4", { rateLimited: false });
+  await handler("providers disable github-copilot", ctx);
+
+  await handler("providers enable github-copilot", ctx);
+  assert.match(notices.at(-1) ?? "", /enabled provider github-copilot/);
+  await handler("providers status --json", ctx);
+  let status = breakerStatus(notices);
+  assert.deepEqual(status.providers, []);
+  assert.deepEqual(status.models.map((record) => record.key), ["openai-codex/gpt-5.4"]);
+
+  await handler("providers enable --all", ctx);
+  await handler("providers status --json", ctx);
+  status = breakerStatus(notices);
+  assert.deepEqual(status.providers, []);
+  assert.deepEqual(status.models, []);
+});
+
+test("an operator disable survives retry-unavailable but not a re-enable", async () => {
+  const { handler, ctx, notices } = harness([COPILOT]);
+  await handler("providers disable github-copilot", ctx);
+  markSessionUnavailable("openai-codex/gpt-5.4", { rateLimited: false });
+
+  await handler("matrix refresh --retry-unavailable", ctx);
+  await handler("providers status --json", ctx);
+  let status = breakerStatus(notices);
+  assert.deepEqual(
+    status.providers.map((record) => record.key),
+    ["github-copilot"],
+    "a freshness command must not undo an explicit operator directive",
+  );
+  assert.deepEqual(status.models, [], "transient model evidence is cleared");
+
+  await handler("providers enable github-copilot", ctx);
+  await handler("providers status --json", ctx);
+  status = breakerStatus(notices);
+  assert.deepEqual(status.providers, []);
+});
+
+test("status prints the primary allowlist too, since the two surfaces are confusable", async () => {
+  const { handler, ctx, notices } = harness([COPILOT]);
+  await handler("primary providers set openai-codex", ctx);
+  await handler("providers disable github-copilot", ctx);
+  await handler("providers status", ctx);
+  const human = notices.at(-1) ?? "";
+  assert.match(human, /provider breaker: disabled=1\[github-copilot\]/);
+  assert.match(human, /escalation threshold=2/);
+  assert.match(human, /primary providers=openai-codex \(persisted, parent-only; separate from the breaker\)/);
+
+  await handler("providers status --json", ctx);
+  assert.deepEqual(breakerStatus(notices).primaryProviders, ["openai-codex"]);
+});
+
+test("the primary-providers notice points at the breaker as the subagent-affecting surface", async () => {
+  const { handler, ctx, notices } = harness([COPILOT]);
+  await handler("primary providers status", ctx);
+  assert.match(notices.at(-1) ?? "", /see \/auto providers status for the session breaker/);
+});
+
+test("provider/id arguments and unknown actions are refused", async () => {
+  const { handler, ctx, notices } = harness([COPILOT]);
+  for (const args of ["providers disable github-copilot/gpt-5", "providers enable a/b"]) {
+    await handler(args, ctx);
+    assert.match(notices.at(-1) ?? "", /provider names only/, args);
+  }
+  await handler("providers disable", ctx);
+  assert.match(notices.at(-1) ?? "", /use \/auto providers disable <provider>/);
+  await handler("providers disable a b", ctx);
+  assert.match(notices.at(-1) ?? "", /use \/auto providers disable <provider>/);
+  await handler("providers bogus github-copilot", ctx);
+  assert.equal(notices.at(-1), "auto-router: unknown providers action");
+  await handler("providers status extra", ctx);
+  assert.equal(notices.at(-1), "auto-router: use /auto providers status [--json]");
+
+  await handler("providers status --json", ctx);
+  assert.deepEqual(breakerStatus(notices).providers, [], "no refused argument mutated state");
+});
+
+test("an unknown provider is warned about but still applied", async () => {
+  const { handler, ctx, notices } = harness([COPILOT]);
+  await handler("providers disable typoed-provider", ctx);
+  assert.match(notices.at(-2) ?? "", /has no credentialed models on this host; applying anyway/);
+  await handler("providers status --json", ctx);
+  assert.deepEqual(
+    breakerStatus(notices).providers.map((record) => record.key),
+    ["typoed-provider"],
+  );
+});
+
+test("auto-escalation trips the breaker from repeated rate-limit evidence", async () => {
+  const { handler, ctx, notices } = harness([COPILOT]);
+  markSessionUnavailable("github-copilot/gpt-5", { rateLimited: true });
+  await handler("providers status --json", ctx);
+  assert.deepEqual(breakerStatus(notices).providers, [], "one model is not a pattern");
+
+  markSessionUnavailable("github-copilot/claude-opus-4.7", { rateLimited: true });
+  await handler("providers status --json", ctx);
+  const status = breakerStatus(notices);
+  assert.equal(status.providers.length, 1);
+  const record = status.providers[0];
+  assert.ok(record);
+  assert.equal(record.key, "github-copilot");
+  assert.equal(record.source, "auto-escalation");
+  assert.match(record.reason, /2 distinct models rate-limited/);
+});
+
+test("the auto status line reports broken providers alongside the primary allowlist", async () => {
+  const { handler, ctx, notices } = harness([COPILOT]);
+  await handler("status", ctx);
+  assert.match(notices.at(-1) ?? "", /brokenProviders=none/);
+  await handler("providers disable github-copilot", ctx);
+  await handler("status", ctx);
+  assert.match(notices.at(-1) ?? "", /brokenProviders=github-copilot/);
 });

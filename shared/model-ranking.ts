@@ -12,6 +12,7 @@
 import type { Candidate } from "./candidates.ts";
 import { LOCAL_PROVIDERS } from "./local-role.ts";
 import type { MatrixTier, RoutingMatrix } from "./routing-matrix.ts";
+import type { ModelDenyView } from "./session-unavailable.ts";
 import { THRESHOLDS, type NormalizedUsage } from "./signals.ts";
 
 /** The output weight in the matrix cost-rank scalar `input + k·output`. */
@@ -70,7 +71,7 @@ export function resolveCapabilityPick(
   candidates: readonly Candidate[],
   taskType: string,
   matrix: RoutingMatrix | null,
-  unavailable: ReadonlySet<string>,
+  unavailable: ModelDenyView,
   usage: NormalizedUsage | null,
   options: RankOptions = {},
 ): Candidate | null {
@@ -110,7 +111,7 @@ export function resolveTierPick(
   tier: MatrixTier,
   taskType: string,
   matrix: RoutingMatrix | null,
-  unavailable: ReadonlySet<string>,
+  unavailable: ModelDenyView,
 ): Candidate | null {
   if (matrix === null) return null;
   const wanted = TIER_RANK[tier];

@@ -4,6 +4,7 @@ import { test } from "node:test";
 import type { AvailabilitySnapshot } from "../shared/availability-snapshot.ts";
 import type { Candidate } from "../shared/candidates.ts";
 import type { MatrixLoadResult } from "../shared/routing-matrix.ts";
+import { createSessionDeny } from "../shared/session-unavailable.ts";
 import {
   buildMatrixStatusPayload,
   formatMatrixStatusHuman,
@@ -55,7 +56,14 @@ const SNAPSHOT: AvailabilitySnapshot = {
   },
 };
 
-function payload(allowlist = ["p/live", "p/unlisted"], unavailable = new Set(["p/dead"])) {
+/** A deny state seeded with model-scope entries only (no breaker escalation). */
+function denyWith(models: readonly string[]) {
+  const deny = createSessionDeny();
+  for (const key of models) deny.mark(key, { rateLimited: false });
+  return deny;
+}
+
+function payload(allowlist = ["p/live", "p/unlisted"], unavailable = denyWith(["p/dead"])) {
   return buildMatrixStatusPayload({
     enabled: true,
     matrixLoad: LOAD,
@@ -93,8 +101,8 @@ test("status reports deterministic matrix, snapshot, coverage, and policy inputs
 });
 
 test("JSON output is stable for equivalent unordered policy inputs", () => {
-  const first = payload(["p/unlisted", "p/live"], new Set(["z/dead", "a/dead"]));
-  const second = payload(["p/live", "p/unlisted"], new Set(["a/dead", "z/dead"]));
+  const first = payload(["p/unlisted", "p/live"], denyWith(["z/dead", "a/dead"]));
+  const second = payload(["p/live", "p/unlisted"], denyWith(["a/dead", "z/dead"]));
   assert.equal(formatMatrixStatusJson(first), formatMatrixStatusJson(second));
 });
 
@@ -114,7 +122,7 @@ test("status surfaces typed matrix and availability failures", () => {
     preferLocalOmlx: false,
     allowlist: [],
     providerAllowlist: [],
-    unavailable: new Set(),
+    unavailable: createSessionDeny(),
   });
   assert.equal(status.matrix.state, "error");
   assert.equal(status.availability.state, "error");

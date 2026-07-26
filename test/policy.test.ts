@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import type { Candidate } from "../shared/candidates.ts";
 import type { RoutingMatrix } from "../shared/routing-matrix.ts";
+import { createSessionDeny } from "../shared/session-unavailable.ts";
 import {
   buildHint,
   buildRoutingPrompt,
@@ -389,4 +390,43 @@ test("buildRoutingPrompt: only-local menu under a restricted lever is local-rest
     "classifier-only",
   );
   assert.deepEqual(built, { ok: false, reason: "local-restricted" });
+});
+
+// --- ADR-0126 (#902): provider-scope breaker in the parent candidate menu ---
+
+test("buildRoutingPrompt drops every model of a broken provider from the menu", async () => {
+  const deny = createSessionDeny();
+  deny.markProvider("anthropic", { source: "operator", reason: "operator disable" });
+  const built = await buildRoutingPrompt(
+    ctx([cand("anthropic", "haiku", 0.8), cand("anthropic", "opus", 5), cand("openai-codex", "gpt", 2)]),
+    "hi",
+    {},
+    deny,
+  );
+  assert.equal(built.ok, true);
+  if (!built.ok) return;
+  // Both anthropic rows go, including the one no failure ever touched.
+  assert.deepEqual(built.targetCandidates.map((c) => `${c.provider}/${c.id}`), ["openai-codex/gpt"]);
+  assert.doesNotMatch(built.prompt.userText, /anthropic\//);
+});
+
+test("buildRoutingPrompt reports all-unavailable when the only provider is broken", async () => {
+  const deny = createSessionDeny();
+  deny.markProvider("anthropic");
+  const built = await buildRoutingPrompt(ctx([cand("anthropic", "haiku", 0.8)]), "hi", {}, deny);
+  assert.deepEqual(built, { ok: false, reason: "all-unavailable" });
+});
+
+test("resolveByTaskType excludes a broken provider's sibling rows it never probed", () => {
+  const deny = createSessionDeny();
+  deny.markProvider("omlx");
+  const pick = resolveByTaskType(THREE, "code-edit", ALL_CAPABLE, deny, null);
+  assert.equal(pick && `${pick.provider}/${pick.id}`, "anthropic/haiku");
+
+  // Auto-escalation reaches the same state from evidence rather than an operator.
+  const escalated = createSessionDeny();
+  escalated.mark("anthropic/haiku", { rateLimited: true });
+  escalated.mark("anthropic/opus", { rateLimited: true });
+  const local = resolveByTaskType(THREE, "code-edit", ALL_CAPABLE, escalated, null);
+  assert.equal(local && `${local.provider}/${local.id}`, "omlx/workhorse");
 });

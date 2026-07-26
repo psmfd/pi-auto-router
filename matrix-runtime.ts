@@ -1,5 +1,6 @@
 import type { AvailabilitySnapshot } from "./shared/availability-snapshot.ts";
 import type { MatrixLoadResult } from "./shared/routing-matrix.ts";
+import type { SessionDeny } from "./shared/session-unavailable.ts";
 
 export interface MatrixRefreshDeps {
   readonly loadMatrix: () => Promise<MatrixLoadResult>;
@@ -9,7 +10,7 @@ export interface MatrixRefreshDeps {
   readonly clearOmlxCache: () => void;
   readonly buildSnapshot: () => Promise<AvailabilitySnapshot>;
   readonly clearDecisionCache: () => void;
-  readonly unavailable: Set<string>;
+  readonly unavailable: SessionDeny;
 }
 
 export interface MatrixRefreshResult {
@@ -24,6 +25,11 @@ export interface MatrixRefreshResult {
  * clears memory caches, reloads the committed matrix, and builds one new shared
  * snapshot generation. Session provider-error denies survive unless the user
  * explicitly requests retry.
+ *
+ * ADR-0126: `--retry-unavailable` clears transient runtime evidence (model
+ * denies and auto-escalated provider breakers) but PRESERVES explicit operator
+ * `/auto providers disable` entries — a freshness command must not silently
+ * undo a deliberate operator directive. `/auto providers enable` is the way out.
  */
 export async function refreshMatrixRuntime(
   deps: MatrixRefreshDeps,
@@ -34,7 +40,7 @@ export async function refreshMatrixRuntime(
   deps.clearAnthropicCache();
   deps.clearOmlxCache();
   deps.clearDecisionCache();
-  if (retryUnavailable) deps.unavailable.clear();
+  if (retryUnavailable) deps.unavailable.clear({ keepOperator: true });
 
   const matrixLoad = await deps.loadMatrix();
   try {

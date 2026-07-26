@@ -76,7 +76,7 @@ flowchart TD
 
 ### Resilience (classifier failover)
 
-The classifier call can fail — most commonly a **429 quota/rate error** from the provider. The router treats any provider error as "this model is unavailable", **fails over to the next candidate** (cheapest-first) until one returns a choice or the list is exhausted, and records the dead `provider/id` in the **shared session-unavailable set** (`shared/session-unavailable.ts`, ADR-0122). That set is excluded from classifier rotation, the parent routing menu, and subagent matrix policy. It is **cleared at `session_start`** so recovered quota gets a fresh chance.
+The classifier call can fail — most commonly a **429 quota/rate error** from the provider. The router treats any provider error as "this model is unavailable", **fails over to the next candidate** (cheapest-first) until one returns a choice or the list is exhausted, and records the dead `provider/id` in the **shared session deny state** (`shared/session-unavailable.ts`, ADR-0122/ADR-0126). That state is excluded from classifier rotation, the parent routing menu, and subagent matrix policy. It is **cleared at `session_start`** so recovered quota gets a fresh chance. Only a conclusively rate-limited probe counts toward the ADR-0126 provider breaker; a generic classifier error denies the exact model and nothing more.
 
 When the cause is specifically a **429 / quota / rate-limit**, the message says so plainly instead of a generic "no choice": `all N candidate model(s) are rate-limited / quota-exhausted (429). Routing paused — use /model to pick a model, or wait for the quota to reset.` Once models are marked unavailable, subsequent prompts hit `no-candidates` (`all-unavailable`) and skip classifier calls entirely — no further quota burn. A normal parent turn is still not replayed after a provider error. An unpinned policy-selected **subagent** has a narrower ADR-0122 exception: it may retry once on the next eligible matrix model only when its structured 429 arrives before any tool-execution event. Explicit pins, session-default children, and post-tool failures never replay.
 
@@ -317,16 +317,18 @@ snapshot generation, and cache epochs prevent an older in-flight provider
 request from repopulating evidence afterward. Building the replacement performs
 provider discovery and may resolve operator-configured credentials (including a
 `models.json` `!command` resolver), just like the first status build. It
-**preserves** the session 429/provider-error deny set by default;
-`--retry-unavailable` explicitly clears that set before rebuilding. Neither
-form writes capability policy.
+**preserves** the session 429/provider-error deny state by default;
+`--retry-unavailable` explicitly clears the transient part before rebuilding —
+model denies and auto-escalated provider breakers — while **preserving explicit
+`/auto providers disable` entries** (ADR-0126), since a freshness command must
+not silently undo an operator directive. Neither form writes capability policy.
 
 `review` is observational and uses only an existing frozen snapshot; it does
 not initiate discovery, credential resolution, or refresh evidence. If no
 snapshot exists, the report says evidence is not built and proposes an explicit
 refresh. It emits stable facts, observations, and human-action proposals plus a
 canonical evidence hash. The hash identifies normalized policy, snapshot hash,
-typed diagnostics, and transient unavailable inputs; it is not a signature of
+typed diagnostics, and transient unavailable inputs (both deny scopes); it is not a signature of
 the rendered bytes or their generation/time display fields. Proposals identify
 additions, changes, or removals that a person should investigate and list the
 evidence required; they never infer or grant capabilities, select a tier, emit
@@ -415,6 +417,70 @@ ADR-0122 adds that exact model to the shared session deny set and permits one
 reselection against the same snapshot/matrix generation. Result telemetry names
 the failed and effective fallback models; any tool edge refuses replay.
 
+### Provider session circuit breaker (#902, ADR-0126)
+
+The primary restriction above is **persisted, parent-only capability policy**.
+The circuit breaker is its transient counterpart: session-scoped runtime
+evidence that governs the parent candidate menu **and** unpinned subagent
+policy. Use it when a provider — not one model row — is out of service, most
+commonly account-wide quota exhaustion.
+
+```text
+/auto providers status [--json]
+/auto providers disable github-copilot
+/auto providers enable github-copilot
+/auto providers enable --all
+```
+
+A provider-scope deny removes **every** model of that provider from the
+classifier rotation, the parent routing menu, and unpinned child matrix
+selection — including rows nothing ever probed. Model-scope denies (ADR-0122)
+keep their exact-row meaning; the only path from one scope to the other is
+auto-escalation.
+
+**Auto-escalation.** Two distinct models of one provider denied with
+conclusive rate-limit evidence trip the breaker automatically
+(`source: auto-escalation`). One 429 is routine; a second means the quota
+rather than the row is exhausted. A generic classifier-probe error denies the
+exact model but never escalates — it says nothing about the account's quota.
+Raise the bar with user-layer
+`extensionSettings.autoRouter.providerBreakerThreshold`; values below two are
+refused, since a threshold of one would make every model 429 provider-wide.
+
+**Provenance.** Every entry records `scope`, `source`
+(`operator` | `runtime-failover` | `classifier-probe` | `auto-escalation`),
+a bounded `reason`, and an ISO timestamp, all rendered by
+`/auto providers status`. Entries are first-writer-wins, so concurrent children
+observing one outage cannot rewrite provenance. `/auto matrix status` and
+`/auto matrix review` carry the same state as additive `deniedProviders` /
+`sessionDeniedProviders` fields.
+
+**Lifecycle.** `session_start` clears every scope, operator disables included —
+nothing persists across sessions (#904 tracks opt-in persistence).
+`/auto matrix refresh --retry-unavailable` clears runtime evidence but
+**preserves** operator disables: a freshness command must not silently undo a
+deliberate directive. `/auto providers enable <p>` is the way out, and it also
+drops the provider's accumulated escalation evidence so a recovered provider
+cannot re-trip on one further failure.
+
+**Explicit pins fail closed** (#903). A wrapper `model:` pin naming a broken
+provider is refused before spawn with `stopReason: "policy-blocked"`, naming
+the breaker's source, reason, and timestamp plus the `/auto providers enable`
+remedy — spawning it would burn a child on a provider known dead this session,
+and substituting a different model would violate the pin. Provider scope only:
+for a **model**-scope deny, ADR-0122's rule that an explicit pin remains
+authoritative and returns its own failure still holds. The ADR-0080 Copilot
+fallback rung is likewise skipped while the `github-copilot` breaker is
+tripped, with a note naming the breaker rather than a bare availability miss.
+
+**Limits.** The breaker cannot stop the *first* concurrent burst — in parallel
+fan-out every child selects before any sibling's 429 returns. What it
+guarantees is that no spawn initiated after a trip, including every ADR-0122
+retry, probes the denied provider.
+
+The command is deliberately independent of `/auto on|off`, because the deny
+state also governs subagent policy while parent routing is off.
+
 ### Lock the orchestrator model while auto-router is active (ADR-0090)
 
 To keep the parent/orchestrator on one exact model while `/auto on` remains
@@ -472,6 +538,9 @@ ADR-0076.
 | `/auto matrix refresh [--retry-unavailable]` | Explicitly reload matrix memory and provider/snapshot/decision caches without writing policy; preserves session-unavailable by default, clears it only with the retry flag. Open `/model` first after editing `models.json`. |
 | `/auto matrix review [--json]` | Emit a deterministic review report with canonical evidence hash, facts, observations, and human-action proposals. Uses the frozen snapshot; has no apply/write mode. |
 | `/auto lock status` / `/auto lock current` / `/auto lock set <provider/id>` / `/auto lock clear` | Inspect, set, or clear the exact parent/orchestrator model lock used while auto-router is active. |
+| `/auto providers status [--json]` | Report the ADR-0126 session circuit breaker — provider- and model-scope denies with `scope`/`source`/`reason`/timestamp provenance, the escalation threshold, and (for contrast) the persisted `primary providers` allowlist. |
+| `/auto providers disable <provider>` | Take a provider out of service for this session: removes every one of its models from parent routing AND unpinned subagent policy. An unregistered provider is warned about, then applied. |
+| `/auto providers enable <provider>` / `/auto providers enable --all` | Re-admit one provider (dropping its model denies and escalation evidence) or clear every scope of the session deny state. |
 | `/auto primary copilot` | Restrict parent/orchestrator routing candidates to `github-copilot/*`; subagent matrix policy is unchanged. |
 | `/auto primary providers set <provider> [...]` | Restrict parent/orchestrator routing to the listed providers. |
 | `/auto primary providers add <provider> [...]` / `/auto primary providers remove <provider> [...]` | Edit the parent/orchestrator provider restriction. |
@@ -507,7 +576,7 @@ persisted `false` (a real `/auto matrix off`) always survives.
 | `classifier.ts` | The `complete()` side-call + JSON parse; graceful `null` on any failure. |
 | `route.ts` | Dispatch logic (structurally typed, unit-tested); returns a `RouteOutcome`. |
 | `matrix-status.ts` | Stable v1 matrix/snapshot/coverage status payload plus human and JSON formatters. |
-| `matrix-runtime.ts` | Explicit refresh orchestration: clear memory caches, optionally retry session-unavailable models, reload policy, and build a new generation. |
+| `matrix-runtime.ts` | Explicit refresh orchestration: clear memory caches, optionally retry session-unavailable models (runtime evidence only — operator provider disables survive, ADR-0126), reload policy, and build a new generation. |
 | `matrix-review.ts` | Pure deterministic facts/observations/proposals report with canonical evidence hashing and human/JSON formatters; no filesystem or policy-write access. |
 | `ephemeral-set-model.ts` | `setModelEphemeral()` (#533, ADR-0096): monkey-patches `SettingsManager.prototype.setDefaultModelAndProvider` to a no-op for the duration of each routed/lock `pi.setModel()` call, so routing never rewrites the persisted global default. **Fail-open** on upstream shape drift (falls back to plain `setModel`, which persists); a microtask-scale race window where a concurrent manual persist would be suppressed is accepted and documented in the module. Retires when upstream ships a persist opt-out (earendil-works/pi#5263). |
 | `../shared/copilot-discovery.ts` | Live GitHub Copilot `/models` discovery — filters the menu to genuinely-usable copilot models (ADR-0035). In `shared/` since #536 (the subagent spawn gate reuses it); auto-router remains the session_start cache-clearer alongside subagent's own. |

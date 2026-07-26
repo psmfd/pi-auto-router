@@ -12,6 +12,7 @@ import { getCandidates, type Candidate, type CandidatesContext, type CandidateOp
 import { filterLocalCandidates, type LocalRole } from "./shared/local-role.ts";
 import { resolveCapabilityPick } from "./shared/model-ranking.ts";
 import type { RoutingMatrix } from "./shared/routing-matrix.ts";
+import type { ModelDenyView } from "./shared/session-unavailable.ts";
 import { getUsage, type NormalizedUsage, type UsageContext } from "./shared/signals.ts";
 import type { TaskType } from "./types.ts";
 
@@ -83,7 +84,7 @@ export async function buildRoutingPrompt(
   ctx: PolicyContext,
   userPrompt: string,
   options: CandidateOptions = {},
-  deny: ReadonlySet<string> = new Set<string>(),
+  deny: ModelDenyView = new Set<string>(),
   localRole: LocalRole = "full",
 ): Promise<RoutingBuild> {
   const all = await getCandidates(ctx, options);
@@ -94,8 +95,11 @@ export async function buildRoutingPrompt(
     const filtered = options.copilotFilter != null && options.copilotFilter.size > 0;
     return { ok: false, reason: filtered ? "copilot-filtered" : "none-credentialed" };
   }
-  const available =
-    deny.size === 0 ? all : all.filter((c) => !deny.has(`${c.provider}/${c.id}`));
+  // ADR-0126: filter unconditionally. Under the two-scope view `size` counts
+  // RECORDS, not denied models — a provider-scope breaker excludes candidates
+  // it never enumerates — so short-circuiting on it couples this filter to an
+  // accounting detail for no measurable gain.
+  const available = all.filter((c) => !deny.has(`${c.provider}/${c.id}`));
   if (available.length === 0) return { ok: false, reason: "all-unavailable" };
 
   // ADR-0094 (#685): two pools. The classifier pool decides which model may
@@ -177,7 +181,7 @@ export function resolveByTaskType(
   candidates: readonly Candidate[],
   taskType: TaskType,
   matrix: RoutingMatrix | null,
-  unavailable: ReadonlySet<string>,
+  unavailable: ModelDenyView,
   usage: NormalizedUsage | null,
 ): Candidate | null {
   if (matrix === null || taskType === "unknown") return null;

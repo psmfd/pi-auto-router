@@ -5,6 +5,7 @@ import { test } from "node:test";
 import type { AvailabilitySnapshot } from "../shared/availability-snapshot.ts";
 import type { Candidate } from "../shared/candidates.ts";
 import type { MatrixLoadResult, MatrixEntry } from "../shared/routing-matrix.ts";
+import { createSessionDeny, type SessionDeny } from "../shared/session-unavailable.ts";
 import {
   buildMatrixReviewPayload,
   extractContextClaims,
@@ -21,10 +22,17 @@ function candidate(provider: string, id: string, contextWindow: number): Candida
   };
 }
 
+/** A deny state seeded with model-scope entries only (no breaker escalation). */
+function denyWith(models: readonly string[]) {
+  const deny = createSessionDeny();
+  for (const key of models) deny.mark(key, { rateLimited: false });
+  return deny;
+}
+
 function fixture(reverse = false): {
   matrixLoad: MatrixLoadResult;
   snapshot: AvailabilitySnapshot;
-  unavailable: Set<string>;
+  unavailable: SessionDeny;
 } {
   const activeRows: Array<[string, MatrixEntry]> = [
     [
@@ -93,7 +101,7 @@ function fixture(reverse = false): {
   return {
     matrixLoad,
     snapshot,
-    unavailable: new Set(reverse ? ["z/dead", "a/dead"] : ["a/dead", "z/dead"]),
+    unavailable: denyWith(reverse ? ["z/dead", "a/dead"] : ["a/dead", "z/dead"]),
   };
 }
 
@@ -111,6 +119,7 @@ test("review covers the 28/11/7/21/4 baseline and detects the Opus context confl
     dangling: 0,
     filtered: 0,
     sessionUnavailable: 2,
+    sessionDeniedProviders: 0,
   });
   const conflict = payload.observations.find(
     (item) => item.kind === "context-rationale-conflict" && item.key === "github-copilot/claude-opus-4.7",
@@ -147,7 +156,7 @@ test("snapshot failures are typed and never serialize raw exception text", () =>
     matrixLoad: null,
     snapshot: null,
     snapshotError: "https://token@example.invalid/private",
-    unavailable: new Set(),
+    unavailable: createSessionDeny(),
   });
   const json = formatMatrixReviewJson(payload);
   assert.match(json, /snapshot-build-failed/);
@@ -178,7 +187,7 @@ test("review reports every typed loader gap even when strict loading rejects the
     const payload = buildMatrixReviewPayload({
       matrixLoad: failedLoad,
       snapshot: null,
-      unavailable: new Set(),
+      unavailable: createSessionDeny(),
     });
     assert.deepEqual(payload.facts.policyGaps[fact], ["p/bad"]);
     assert.ok(payload.observations.some((item) => item.kind === kind && item.key === "p/bad"));
@@ -196,7 +205,7 @@ test("missing matrix diagnostics remain visible and produce evidence collection"
   const payload = buildMatrixReviewPayload({
     matrixLoad: missing,
     snapshot: null,
-    unavailable: new Set(),
+    unavailable: createSessionDeny(),
   });
   assert.ok(payload.observations.some((item) => item.kind === "matrix-diagnostic" && item.key === "missing"));
   assert.ok(payload.proposals.some((item) => item.action === "collect-evidence" && item.target === "matrix"));
@@ -244,7 +253,7 @@ test("review distinguishes dangling, filtered, inert, and filtered-unlisted evid
       omlx: { state: "not-applicable" },
     },
   };
-  const payload = buildMatrixReviewPayload({ matrixLoad, snapshot, unavailable: new Set() });
+  const payload = buildMatrixReviewPayload({ matrixLoad, snapshot, unavailable: createSessionDeny() });
   assert.deepEqual(payload.facts.danglingRows, ["github-copilot/dangling"]);
   assert.deepEqual(payload.facts.filteredRows, ["github-copilot/filtered"]);
   assert.deepEqual(payload.facts.inertRows, ["anthropic/inert"]);
@@ -290,7 +299,7 @@ test("inconclusive provider evidence fails open without filtered classifications
       omlx: { state: "not-applicable" },
     },
   };
-  const payload = buildMatrixReviewPayload({ matrixLoad, snapshot, unavailable: new Set() });
+  const payload = buildMatrixReviewPayload({ matrixLoad, snapshot, unavailable: createSessionDeny() });
   assert.deepEqual(payload.facts.filteredRows, []);
   assert.deepEqual(payload.facts.unlistedFilteredModels, []);
   assert.deepEqual(payload.facts.unlistedLiveModels, ["github-copilot/unlisted"]);
@@ -332,7 +341,7 @@ test("report detail is bounded while counts and evidence hash cover the full inp
       omlx: { state: "not-applicable" },
     },
   };
-  const payload = buildMatrixReviewPayload({ matrixLoad, snapshot, unavailable: new Set() });
+  const payload = buildMatrixReviewPayload({ matrixLoad, snapshot, unavailable: createSessionDeny() });
   assert.equal(payload.counts.unlisted, 150);
   assert.equal(payload.facts.unlistedModels.length, 100);
   assert.equal(payload.facts.omitted.unlistedModels, 50);
@@ -362,7 +371,7 @@ test("policy-gap detail caps have explicit omission counters", () => {
   const payload = buildMatrixReviewPayload({
     matrixLoad,
     snapshot: null,
-    unavailable: new Set(),
+    unavailable: createSessionDeny(),
   });
   assert.equal(payload.facts.policyRows.length, 100);
   assert.equal(payload.facts.omitted.policyRows, 50);
@@ -399,7 +408,7 @@ test("per-row context claim details are capped with an explicit omission count",
       omlx: { state: "not-applicable" },
     },
   };
-  const payload = buildMatrixReviewPayload({ matrixLoad, snapshot, unavailable: new Set() });
+  const payload = buildMatrixReviewPayload({ matrixLoad, snapshot, unavailable: createSessionDeny() });
   assert.equal(payload.facts.policyRows[0]?.contextClaims.length, 100);
   assert.equal(payload.facts.policyRows[0]?.contextClaimsOmitted, 50);
   assert.match(
@@ -449,5 +458,33 @@ test("no-write invariant: review module has no filesystem, subprocess, or policy
   assert.doesNotMatch(
     source,
     /node:fs|child_process|writeFile|appendFile|createWriteStream|registerTool|routing-matrix\.json/,
+  );
+});
+
+test("review reports a provider breaker as its own observation kind (ADR-0126)", () => {
+  const base = fixture();
+  const unavailable = denyWith(["a/dead", "z/dead"]);
+  unavailable.markProvider("github-copilot", { source: "operator", reason: "operator disable" });
+  const payload = buildMatrixReviewPayload({ ...base, unavailable });
+
+  assert.equal(payload.counts.sessionDeniedProviders, 1);
+  assert.deepEqual(payload.facts.sessionDeniedProviders, ["github-copilot"]);
+  assert.deepEqual(payload.facts.sessionUnavailable, ["a/dead", "z/dead"], "scopes stay separate");
+  const observation = payload.observations.find((item) => item.kind === "session-provider-denied");
+  assert.ok(observation);
+  assert.equal(observation.key, "github-copilot");
+  assert.match(observation.detail, /operator/);
+  assert.match(observation.detail, /transient and separate from capability policy/);
+  // A breaker is evidence, never policy: it must not propose a matrix change.
+  assert.equal(payload.proposals.some((item) => item.target === "github-copilot"), false);
+});
+
+test("the review evidence hash covers provider-scope denies", () => {
+  const base = fixture();
+  const withBreaker = denyWith(["a/dead", "z/dead"]);
+  withBreaker.markProvider("github-copilot");
+  assert.notEqual(
+    buildMatrixReviewPayload({ ...base, unavailable: withBreaker }).evidenceHash,
+    buildMatrixReviewPayload(fixture()).evidenceHash,
   );
 });

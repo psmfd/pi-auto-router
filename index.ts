@@ -33,8 +33,10 @@ import {
   type RoutingMatrix,
 } from "./shared/routing-matrix.ts";
 import {
-  clearSessionUnavailable,
-  sessionUnavailableModels,
+  DEFAULT_BREAKER_THRESHOLD,
+  sessionDeny,
+  type DenyRecord,
+  type SessionDeny,
 } from "./shared/session-unavailable.ts";
 import { hasExplicitModelFlag } from "./argv-guard.ts";
 import { clearCopilotCache } from "./shared/copilot-discovery.ts";
@@ -57,7 +59,7 @@ import * as state from "./state.ts";
 import type { PickSource, TaskType } from "./types.ts";
 
 export const AUTO_COMMAND_DESCRIPTION =
-  "Auto model routing: /auto [status|settings [status]|on|off|matrix [status [--json]|review [--json]|refresh [--retry-unavailable]|on|off]|lock [status|current|set provider/id|clear]|(primary|orchestrator) [status|copilot|clear|providers [status|clear|set provider...|add provider...|remove provider...]]]";
+  "Auto model routing: /auto [status|settings [status]|on|off|matrix [status [--json]|review [--json]|refresh [--retry-unavailable]|on|off]|lock [status|current|set provider/id|clear]|providers [status [--json]|disable provider|enable provider|enable --all]|(primary|orchestrator) [status|copilot|clear|providers [status|clear|set provider...|add provider...|remove provider...]]]";
 
 /** Persistent status-bar segment showing the model currently in use. */
 function showModel(ctx: ExtensionContext, provider: string, id: string): void {
@@ -149,6 +151,57 @@ function formatProviders(providers: readonly string[]): string {
   return providers.length > 0 ? providers.join(",") : "all";
 }
 
+function formatList(values: readonly string[]): string {
+  return values.length > 0 ? values.join(",") : "none";
+}
+
+/** One deny record as a single human-readable provenance line (ADR-0126). */
+function formatDenyRecord(record: DenyRecord): string {
+  return `  ${record.key} — ${record.scope}, ${record.source}, ${record.reason}, ${record.at}`;
+}
+
+/**
+ * The `/auto providers status` block. It deliberately also prints the
+ * `primary providers` allowlist: the two surfaces are easy to confuse, and
+ * they answer different questions — the breaker is transient session evidence
+ * governing BOTH parent routing and unpinned child policy, while the primary
+ * allowlist is persisted parent-only policy (ADR-0083, unchanged by #902).
+ */
+function formatProviderBreakerHuman(
+  deny: SessionDeny,
+  primaryProviders: readonly string[],
+): string {
+  const providers = deny.providers();
+  const models = deny.models();
+  const lines = [
+    `provider breaker: disabled=${providers.length}[${formatList(providers.map((r) => r.key))}]; ` +
+      `model denies=${models.length}[${formatList(models.map((r) => r.key))}]; ` +
+      `escalation threshold=${deny.threshold}`,
+    ...providers.map(formatDenyRecord),
+    ...models.map(formatDenyRecord),
+    `primary providers=${formatProviders(primaryProviders)} (persisted, parent-only; separate from the breaker)`,
+  ];
+  return lines.join("\n");
+}
+
+function providerBreakerPayload(
+  deny: SessionDeny,
+  primaryProviders: readonly string[],
+): string {
+  return JSON.stringify(
+    {
+      v: 1,
+      kind: "provider-breaker-status",
+      threshold: deny.threshold,
+      providers: deny.providers(),
+      models: deny.models(),
+      primaryProviders: [...primaryProviders],
+    },
+    null,
+    2,
+  );
+}
+
 function modelKey(model: { provider: string; id: string }): string {
   return `${model.provider}/${model.id}`;
 }
@@ -185,9 +238,29 @@ async function readPreferLocalOmlxSetting(): Promise<boolean> {
   }
 }
 
+/**
+ * ADR-0126 auto-escalation threshold: distinct rate-limited models of one
+ * provider before its breaker trips. Resolves to DEFAULT_BREAKER_THRESHOLD
+ * whenever the setting is absent or non-numeric — deliberately NOT "leave the
+ * current value", because the deny state is process-local and outlives one
+ * session_start: returning undefined would let a threshold configured in an
+ * earlier session survive its own removal from settings. The state itself
+ * refuses anything below the two-model floor, so a malformed or
+ * over-permissive value cannot erase the model/provider distinction.
+ */
+async function readProviderBreakerThreshold(): Promise<number> {
+  try {
+    const j = await readUserSettings();
+    const v = j?.extensionSettings?.autoRouter?.providerBreakerThreshold;
+    return typeof v === "number" ? v : DEFAULT_BREAKER_THRESHOLD;
+  } catch {
+    return DEFAULT_BREAKER_THRESHOLD;
+  }
+}
+
 type UserSettingsJson = {
   extensionSettings?: {
-    autoRouter?: { preferLocalOmlx?: unknown };
+    autoRouter?: { preferLocalOmlx?: unknown; providerBreakerThreshold?: unknown };
     localLlm?: { role?: unknown };
   };
 };
@@ -235,8 +308,9 @@ export default function autoRouter(pi: ExtensionAPI): void {
   let matrix: RoutingMatrix | null = null;
   let matrixLoad: MatrixLoadResult | null = null;
   // Canonical process-local provider deny state shared with subagent runtime
-  // failover. Skipped as classifier, routing, and child-policy targets.
-  const unavailable = sessionUnavailableModels;
+  // failover. Skipped as classifier, routing, and child-policy targets. Two
+  // scopes since ADR-0126: exact models, and whole-provider breakers.
+  const unavailable = sessionDeny;
   // #351 measurement pipeline: the routed prompt's task-type label (plus the
   // #352 matrix/classifier source), STICKY across every assistant
   // `message_end` until the next routing attempt — an agentic turn produces
@@ -277,7 +351,11 @@ export default function autoRouter(pi: ExtensionAPI): void {
     cfg = await state.load();
     matrixLoad = await loadRoutingMatrixResult(); // per-session reload: edits apply next session (#352)
     matrix = matrixLoad.matrix;
-    clearSessionUnavailable(); // give quota-recovered models a fresh chance each session
+    // Give quota-recovered models AND providers a fresh chance each session:
+    // no `keepOperator` here, so even an explicit `/auto providers disable`
+    // ends with the session (ADR-0126; #904 tracks opt-in persistence).
+    unavailable.clear();
+    unavailable.setThreshold(await readProviderBreakerThreshold());
     // ADR-0094 review fix: routing decisions cache the resolved TARGET, and a
     // cache hit bypasses the two-pool lever filtering in buildRoutingPrompt —
     // a decision cached under a permissive lever must not replay after the
@@ -311,7 +389,9 @@ export default function autoRouter(pi: ExtensionAPI): void {
       `preferLocalOmlx=${preferLocalOmlx ? "on" : "off"}; ` +
       `localRole=${localRole}; ` +
       `orchestratorLock=${cfg.orchestratorModelLock ?? "none"}; ` +
-      `primaryProviders=${formatProviders(cfg.orchestratorAllowedProviders)}`
+      `primaryProviders=${formatProviders(cfg.orchestratorAllowedProviders)}; ` +
+      // formatList (not formatProviders): an empty breaker is "none", never "all".
+      `brokenProviders=${formatList(unavailable.providers().map((r) => r.key))}`
     );
   };
 
@@ -653,6 +733,78 @@ export default function autoRouter(pi: ExtensionAPI): void {
         );
         return;
       }
+      if (parts[0] === "providers") {
+        // ADR-0126 session circuit breaker. Deliberately independent of
+        // `cfg.enabled`: the deny state governs unpinned SUBAGENT policy too,
+        // so it must be operable with parent routing switched off.
+        const sub = parts[1] ?? "status";
+        const target = parts[2] ?? "";
+        if (sub === "status") {
+          if ((target !== "" && target !== "--json") || parts.length > 3) {
+            ctx.ui.notify("auto-router: use /auto providers status [--json]", "warning");
+            return;
+          }
+          ctx.ui.notify(
+            target === "--json"
+              ? providerBreakerPayload(unavailable, cfg.orchestratorAllowedProviders)
+              : `auto-router: ${formatProviderBreakerHuman(unavailable, cfg.orchestratorAllowedProviders)}`,
+            "info",
+          );
+          return;
+        }
+        if (sub !== "disable" && sub !== "enable") {
+          ctx.ui.notify("auto-router: unknown providers action", "warning");
+          return;
+        }
+        if (sub === "enable" && target === "--all") {
+          if (parts.length > 3) {
+            ctx.ui.notify("auto-router: use /auto providers enable --all", "warning");
+            return;
+          }
+          unavailable.clear();
+          cache.clear();
+          ctx.ui.notify(
+            `auto-router: cleared all session deny state\n${formatProviderBreakerHuman(unavailable, cfg.orchestratorAllowedProviders)}`,
+            "info",
+          );
+          return;
+        }
+        if (target === "" || parts.length > 3 || hasRejectedProviders([target])) {
+          ctx.ui.notify(
+            `auto-router: use /auto providers ${sub} <provider> — provider names only (for example github-copilot)`,
+            "warning",
+          );
+          return;
+        }
+        const provider = normalizeProviders([target])[0];
+        if (provider === undefined) {
+          ctx.ui.notify(`auto-router: use /auto providers ${sub} <provider>`, "warning");
+          return;
+        }
+        // A provider absent from the registry is WARNED, never refused: a
+        // silent no-op on a typo is the worse failure, and a disable is
+        // harmless for a provider that has no candidates anyway.
+        const known = new Set(ctx.modelRegistry.getAvailable().map((m) => m.provider.trim().toLowerCase()));
+        if (!known.has(provider)) {
+          ctx.ui.notify(
+            `auto-router: "${provider}" has no credentialed models on this host; applying anyway (check the spelling)`,
+            "warning",
+          );
+        }
+        if (sub === "disable") {
+          unavailable.markProvider(provider, { source: "operator", reason: "operator disable" });
+        } else {
+          unavailable.clearProvider(provider);
+        }
+        // A routing decision cached under the previous deny state must not
+        // replay — same rationale as every other policy-mutating command here.
+        cache.clear();
+        ctx.ui.notify(
+          `auto-router: ${sub}d provider ${provider}\n${formatProviderBreakerHuman(unavailable, cfg.orchestratorAllowedProviders)}`,
+          "info",
+        );
+        return;
+      }
       if (parts[0] === "primary" || parts[0] === "orchestrator") {
         const sub = parts[1] ?? "status";
         if (sub === "copilot") {
@@ -713,7 +865,8 @@ export default function autoRouter(pi: ExtensionAPI): void {
         }
         ctx.ui.notify(
           `auto-router: primary providers=${formatProviders(cfg.orchestratorAllowedProviders)}; ` +
-            "subagent frontmatter pins are unchanged",
+            "subagent frontmatter pins are unchanged; " +
+            "see /auto providers status for the session breaker (which does affect subagents)",
           "info",
         );
         return;

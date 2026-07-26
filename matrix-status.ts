@@ -5,6 +5,7 @@ import {
   type MatrixLoadResult,
   type RefreshMetadata,
 } from "./shared/routing-matrix.ts";
+import type { SessionDeny } from "./shared/session-unavailable.ts";
 
 export interface MatrixStatusInput {
   readonly enabled: boolean;
@@ -15,7 +16,7 @@ export interface MatrixStatusInput {
   readonly preferLocalOmlx: boolean;
   readonly allowlist: readonly string[];
   readonly providerAllowlist: readonly string[];
-  readonly unavailable: ReadonlySet<string>;
+  readonly unavailable: SessionDeny;
   readonly now?: Date;
 }
 
@@ -86,7 +87,15 @@ export interface MatrixStatusPayload {
     readonly preferLocalOmlx: boolean;
     readonly allowlist: readonly string[];
     readonly providerAllowlist: readonly string[];
+    /** Model-scope session denies (`provider/id`). */
     readonly unavailable: readonly string[];
+    /**
+     * ADR-0126 provider-scope breakers (bare provider ids). Additive: the
+     * `unavailable` list above keeps its original model-only meaning, so
+     * existing consumers are unaffected. `/auto providers status` carries the
+     * per-record provenance this key-only list omits.
+     */
+    readonly deniedProviders: readonly string[];
   };
   readonly registryReload: "current-process; open /model before refresh after editing models.json";
 }
@@ -187,7 +196,8 @@ export function buildMatrixStatusPayload(input: MatrixStatusInput): MatrixStatus
       preferLocalOmlx: input.preferLocalOmlx,
       allowlist: [...input.allowlist].sort(compareText),
       providerAllowlist: [...input.providerAllowlist].sort(compareText),
-      unavailable: [...input.unavailable].sort(compareText),
+      unavailable: input.unavailable.models().map((record) => record.key),
+      deniedProviders: input.unavailable.providers().map((record) => record.key),
     },
     registryReload: "current-process; open /model before refresh after editing models.json",
   };
@@ -229,7 +239,8 @@ export function formatMatrixStatusHuman(payload: MatrixStatusPayload): string {
     `localRole=${payload.policy.localRole} preferLocalOmlx=${payload.policy.preferLocalOmlx ? "on" : "off"} ` +
     `allowlist=${payload.policy.allowlist.length}[${formatList(payload.policy.allowlist)}] ` +
     `providers=${payload.policy.providerAllowlist.length}[${formatList(payload.policy.providerAllowlist)}] ` +
-    `unavailable=${payload.policy.unavailable.length}[${formatList(payload.policy.unavailable)}]`;
+    `unavailable=${payload.policy.unavailable.length}[${formatList(payload.policy.unavailable)}] ` +
+    `deniedProviders=${payload.policy.deniedProviders.length}[${formatList(payload.policy.deniedProviders)}]`;
   const registry = `registryReload=${payload.registryReload}`;
   return [matrix, availability, coverage, filters, policy, registry]
     .filter(Boolean)
