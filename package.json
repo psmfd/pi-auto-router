@@ -19,7 +19,7 @@
     "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "0.81.1"
+    "@earendil-works/pi-ai": "0.82.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.75"
