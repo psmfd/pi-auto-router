@@ -26,6 +26,7 @@ import {
   resolveOmlxFilter,
   type OmlxFilterContext,
 } from "./omlx-discovery.ts";
+import { type ProviderAuthLike } from "./provider-headers.ts";
 
 export type AvailabilityEvidenceState = "not-applicable" | "verified" | "inconclusive";
 
@@ -63,17 +64,7 @@ export interface AvailabilitySnapshotContext {
       | Promise<readonly SnapshotRegistryModel[]>
       | readonly SnapshotRegistryModel[];
     find(provider: string, id: string): unknown;
-    getApiKeyAndHeaders(model: unknown):
-      | Promise<{
-          readonly ok: boolean;
-          readonly apiKey?: string | undefined;
-          readonly headers?: Record<string, string> | undefined;
-        }>
-      | {
-          readonly ok: boolean;
-          readonly apiKey?: string | undefined;
-          readonly headers?: Record<string, string> | undefined;
-        };
+    getApiKeyAndHeaders(model: unknown): Promise<ProviderAuthLike> | ProviderAuthLike;
   };
 }
 

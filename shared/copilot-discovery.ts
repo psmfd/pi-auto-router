@@ -22,6 +22,8 @@
  * breaks (#343 / ADR-0031).
  */
 
+import { mergeProviderHeaders, type ProviderAuthLike } from "./provider-headers.ts";
+
 /** The Copilot API hosts the JWT may be sent to (exact-host match). */
 export const COPILOT_API_HOSTS: ReadonlySet<string> = new Set([
   "api.individual.githubcopilot.com",
@@ -115,7 +117,7 @@ async function awaitWithSignal<T>(value: Promise<T> | T, signal: AbortSignal): P
 }
 
 export async function fetchCopilotEnabledModels(
-  auth: { readonly ok: boolean; readonly apiKey?: string | undefined; readonly headers?: Record<string, string> | undefined },
+  auth: ProviderAuthLike,
   deps: DiscoveryDeps = {},
 ): Promise<Set<string> | null> {
   if (!auth.ok || !auth.apiKey) return null;
@@ -135,7 +137,7 @@ export async function fetchCopilotEnabledModels(
 
   try {
     const res = await fetchFn(`${base}/models`, {
-      headers: { ...(auth.headers ?? {}), Authorization: `Bearer ${auth.apiKey}` },
+      headers: { ...mergeProviderHeaders({}, auth.headers), Authorization: `Bearer ${auth.apiKey}` },
       redirect: "error", // a redirect must never carry the Bearer token off-host
       signal: boundedSignal(deps.signal, deps.timeoutMs),
     });
@@ -161,7 +163,7 @@ export function clearCopilotCache(): void {
 
 /** Cached wrapper around {@link fetchCopilotEnabledModels} (20-min TTL). */
 export async function getEnabledCopilotModels(
-  auth: { readonly ok: boolean; readonly apiKey?: string | undefined; readonly headers?: Record<string, string> | undefined },
+  auth: ProviderAuthLike,
   deps: DiscoveryDeps = {},
 ): Promise<Set<string> | null> {
   const now = (deps.now ?? Date.now)();
@@ -179,9 +181,7 @@ export interface CopilotAuthContext {
   readonly modelRegistry: {
     getAvailable(): Promise<readonly { provider: string; id: string }[]> | readonly { provider: string; id: string }[];
     find(provider: string, id: string): unknown;
-    getApiKeyAndHeaders(model: unknown):
-      | Promise<{ ok: boolean; apiKey?: string | undefined; headers?: Record<string, string> | undefined }>
-      | { ok: boolean; apiKey?: string | undefined; headers?: Record<string, string> | undefined };
+    getApiKeyAndHeaders(model: unknown): Promise<ProviderAuthLike> | ProviderAuthLike;
   };
 }
 

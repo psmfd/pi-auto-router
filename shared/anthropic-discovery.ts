@@ -27,6 +27,8 @@
  * and routing must never break (ADR-0031).
  */
 
+import { mergeProviderHeaders, type ProviderAuthLike } from "./provider-headers.ts";
+
 const ANTHROPIC_BASE = "https://api.anthropic.com";
 const ANTHROPIC_VERSION = "2023-06-01";
 const MAX_BODY_BYTES = 256 * 1024;
@@ -58,11 +60,7 @@ export interface DiscoveryDeps {
   readonly timeoutMs?: number;
 }
 
-export interface AuthLike {
-  readonly ok: boolean;
-  readonly apiKey?: string | undefined;
-  readonly headers?: Record<string, string> | undefined;
-}
+export type AuthLike = ProviderAuthLike;
 
 /**
  * Build the request headers for `/v1/models` from pi's Auth shape, mirroring
@@ -76,8 +74,7 @@ export function buildAnthropicHeaders(auth: AuthLike): Record<string, string> | 
     ? { authorization: `Bearer ${auth.apiKey}`, "anthropic-beta": "oauth-2025-04-20" }
     : { "x-api-key": auth.apiKey };
   return {
-    accept: "application/json",
-    ...(auth.headers ?? {}),
+    ...mergeProviderHeaders({ accept: "application/json" }, auth.headers),
     ...credential,
     "anthropic-version": ANTHROPIC_VERSION,
   };
