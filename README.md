@@ -403,11 +403,12 @@ candidates instead of falling through to local.
 
 This split is intentionally scoped to auto-router's parent-session
 `pi.setModel()` path. Subagent children independently consume the same frozen
-availability snapshot and capability matrix. Thirteen first-party wrappers
-request local eligibility with `local-llm: true`; `code-review-expert` and
+availability snapshot and capability matrix. Fourteen first-party wrappers
+request local eligibility with `local-llm: true`, including the mechanically
+read-only `gitflow-expert` under ADR-0149; `code-review-expert` and
 `security-review-expert` request `capability-tier: frontier` (`linter`
-carries no tier); and local-forbidden wrappers (including `bash`
-tool surfaces) remove local candidates before matrix selection. No first-party
+carries no tier); and local-forbidden wrappers (including `bash` tool surfaces)
+remove local candidates before matrix selection. No first-party
 wrapper currently carries an exact `model:` pin. Explicit third-party pins
 remain authoritative and still pass through the spawn-time liveness/fallback
 gate. A local-forbidden child with no non-local matrix pick fails closed rather
